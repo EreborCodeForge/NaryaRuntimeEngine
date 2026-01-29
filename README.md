@@ -7,12 +7,10 @@
 | |\  |/ ___ \|  _ < | |   / ___ \ 
 |_| \_/_/   \_\_| \_\|_|  /_/   \_\
 
-Runtime Engine - Keeping the flame alive
+NaryaEngineRunner — The Runtime that Ignites and Scales Applications
 ```
 
 **Narya** is a high-performance runtime engine that turns traditional PHP applications into always-on servers with persistent workers. Built in **Go** with **Unix Domain Sockets** and **MessagePack** for inter-process communication, it removes the per-request PHP bootstrap overhead.
-
-> **Lore**: Narya is one of the Three Rings of Power (the Ring of Fire). Just as Narya keeps the flame alive and inspires hope, this runtime keeps your PHP frameworks warm and ready, inspiring performance and stability.
 
 ---
 
