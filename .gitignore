@@ -1,0 +1,47 @@
+# Narya Runtime Engine - Git ignore
+
+# Build output
+/narya
+/narya.exe
+*.exe
+*.test
+*.out
+/bin/
+/dist/
+/build/
+
+# Go
+/vendor/
+
+# Config (real config may contain secrets; example is committed)
+.rr.yaml
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# PHP (if present in repo)
+/vendor/
+.phpunit.result.cache
+composer.lock
+
+# Temp / backup
+*.bak
+*.tmp
+*.tmp.*

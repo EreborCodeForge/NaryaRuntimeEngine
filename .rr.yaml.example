@@ -1,0 +1,53 @@
+# Narya Runtime Engine Configuration
+# Copy this file to .rr.yaml and adjust as needed.
+
+server:
+  # Bind address (0.0.0.0 to accept external connections)
+  host: 0.0.0.0
+  # HTTP port
+  port: 8888
+  # Read timeout in seconds
+  read_timeout: 60
+  # Write timeout in seconds
+  write_timeout: 60
+  # Enable HTTP/2
+  enable_http2: true
+
+workers:
+  # Number of PHP workers
+  count: 8
+  # Dynamic scaling: min and max workers
+  # Must satisfy: min_workers <= count <= max_workers
+  min_workers: 2                 # minimum always active (warm)
+  max_workers: 12                # maximum workers under load
+  # Idle seconds before scaling down one worker at a time
+  scale_down_idle_secs: 30
+  # After this many idle seconds, scale down to minimum at once
+  aggressive_scale_down_secs: 10
+  # Recycle worker after N requests
+  max_requests: 10000
+  # Per-request timeout in seconds
+  timeout: 30
+
+  # Overflow strategy — only ONE may be enabled
+  # Option 1: Backpressure — reject immediately when queue is full (503)
+  backpressure:
+    enabled: false
+    max_queue: 10000             # max requests in queue (0 = no queue)
+
+  # Option 2: Queue timeout — wait up to timeout, then reject (503)
+  queue_timeout:
+    enabled: false
+    timeout_ms: 500              # max wait time in queue (ms)
+
+php:
+  # Path to PHP binary
+  binary: php
+  # Worker entry script (absolute or relative to project)
+  worker_script: worker.php
+
+logging:
+  # Level: debug, info, warn, error
+  level: info
+  # Format: text, json
+  format: text
