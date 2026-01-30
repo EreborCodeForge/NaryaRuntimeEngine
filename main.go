@@ -29,6 +29,9 @@ The Runtime that Ignites and Scales Applications
 `
 )
 
+// RuntimeVersion is exposed so the worker pool can attach it to every request for PHP SDK traceability.
+var RuntimeVersion = version
+
 type Server struct {
 	config     *Config
 	pool       *WorkerPool

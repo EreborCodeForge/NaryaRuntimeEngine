@@ -756,6 +756,9 @@ func (w *Worker) Execute(req *Request) (*Response, error) {
 		w.conn.SetDeadline(deadline)
 	}
 
+	req.WorkerID = w.ID
+	req.RuntimeVersion = RuntimeVersion
+
 	if err := w.protocol.SendRequest(w.conn, req); err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}

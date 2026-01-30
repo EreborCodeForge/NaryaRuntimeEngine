@@ -18,18 +18,20 @@ const (
 var requestIDCounter uint64
 
 type Request struct {
-	ID         uint64              `msgpack:"id"`
-	Method     string              `msgpack:"method"`
-	URI        string              `msgpack:"uri"`
-	Path       string              `msgpack:"path"`
-	Query      string              `msgpack:"query"`
-	Headers    map[string][]string `msgpack:"headers"`
-	Body       []byte              `msgpack:"body"`
-	RemoteAddr string              `msgpack:"remote_addr"`
-	Host       string              `msgpack:"host"`
-	Scheme     string              `msgpack:"scheme"`
-	TimeoutMs  int                 `msgpack:"timeout_ms"`
-	Meta       map[string]string   `msgpack:"meta,omitempty"`
+	ID              uint64              `msgpack:"id"`
+	Method          string              `msgpack:"method"`
+	URI             string              `msgpack:"uri"`
+	Path           string              `msgpack:"path"`
+	Query           string              `msgpack:"query"`
+	Headers         map[string][]string `msgpack:"headers"`
+	Body            []byte              `msgpack:"body"`
+	RemoteAddr      string              `msgpack:"remote_addr"`
+	Host            string              `msgpack:"host"`
+	Scheme          string              `msgpack:"scheme"`
+	TimeoutMs       int                 `msgpack:"timeout_ms"`
+	Meta            map[string]string   `msgpack:"meta,omitempty"`
+	WorkerID        int                 `msgpack:"worker_id,omitempty"`   // set by runtime for PHP SDK traceability
+	RuntimeVersion  string              `msgpack:"runtime_version,omitempty"` // set by runtime for PHP SDK traceability
 }
 
 type Response struct {

@@ -313,6 +313,8 @@ try {
 ### Request (Go → PHP)
 
 - `id`, `method`, `uri`, `path`, `query`, `headers`, `body`, `remote_addr`, `host`, `scheme`, `timeout_ms`
+- **`worker_id`** (int) — Set by the runtime on every request. Identifies which PHP worker process is handling the request. Use in the PHP SDK for logs, metrics, and distributed tracing.
+- **`runtime_version`** (string) — Set by the runtime on every request. Version of the Narya Go binary (e.g. `2.0.0`). Use in the PHP SDK for traceability and compatibility checks.
 
 ### Response (PHP → Go)
 
