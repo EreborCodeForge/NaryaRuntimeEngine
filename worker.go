@@ -149,6 +149,19 @@ func (p *WorkerPool) Start() error {
 		return fmt.Errorf("failed to create socket directory: %w", err)
 	}
 
+	// Remove leftover *.sock from previous runs (orphan workers)
+	entries, err := os.ReadDir(p.sockDir)
+	if err == nil {
+		for _, e := range entries {
+			if !e.IsDir() && filepath.Ext(e.Name()) == ".sock" {
+				path := filepath.Join(p.sockDir, e.Name())
+				if errRemove := os.Remove(path); errRemove != nil && !os.IsNotExist(errRemove) {
+					p.logger.Warn("Failed to remove old socket %s: %v", path, errRemove)
+				}
+			}
+		}
+	}
+
 	p.logger.Info("Starting pool with %d workers (min=%d max=%d, UDS: %s)", p.initialWorkers, p.minWorkers, p.maxWorkers, p.sockDir)
 
 	for i := 0; i < p.initialWorkers; i++ {
@@ -177,7 +190,7 @@ func (p *WorkerPool) Start() error {
 	} else if p.queueTimeoutEnabled {
 		p.logger.Info("Queue timeout enabled: timeout=%dms", p.queueTimeoutMs)
 	} else {
-		p.logger.Info("Sem limite de fila (modo padrão)")
+		p.logger.Info("No queue limit (default mode)")
 	}
 
 	go p.healthMonitor()
@@ -577,6 +590,15 @@ func (p *WorkerPool) removeWorker(w *Worker) {
 }
 
 func (p *WorkerPool) destroyWorker(w *Worker) {
+	sockPath := w.sockPath
+	defer func() {
+		if sockPath != "" {
+			if err := os.Remove(sockPath); err != nil && !os.IsNotExist(err) {
+				p.logger.Warn("Failed to remove socket %s: %v", sockPath, err)
+			}
+		}
+	}()
+
 	if w.conn != nil {
 		w.conn.Close()
 	}
@@ -593,7 +615,6 @@ func (p *WorkerPool) destroyWorker(w *Worker) {
 			w.cmd.Process.Kill()
 		}
 	}
-	os.Remove(w.sockPath)
 }
 
 func (p *WorkerPool) scalerLoop() {
