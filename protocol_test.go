@@ -19,10 +19,11 @@ func TestProtocolWriteReadFrame(t *testing.T) {
 		t.Fatalf("Wrong size: expected %d, got %d", 4+len(original), buf.Len())
 	}
 
-	result, err := protocol.ReadFrame(&buf)
+	result, release, err := protocol.ReadFrame(&buf)
 	if err != nil {
-		t.Fatalf("Erro ao ler frame: %v", err)
+		t.Fatalf("Failed to read frame: %v", err)
 	}
+	defer release()
 
 	if !bytes.Equal(result, original) {
 		t.Errorf("Content mismatch: expected %v, got %v", original, result)

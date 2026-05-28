@@ -1,0 +1,36 @@
+server:
+  host: 0.0.0.0
+  port: 8888
+  read_timeout: 60
+  write_timeout: 60
+  enable_http2: true
+
+workers:
+  count: 16
+  # Escalonamento dinâmico: min e max de workers
+  # Sempre vale: min_workers <= count <= max_workers
+  min_workers: 16                 # mínimo sempre ativo (warm)
+  max_workers: 16              # teto de workers em pico
+  scale_down_idle_secs: 30       # segundos ociosos para reduzir de forma suave (1 por vez)
+  aggressive_scale_down_secs: 10 # após 10s ocioso, derruba tudo até o mínimo de uma vez
+  max_requests: 10000
+  timeout: 30
+  
+  # Estratégia de overflow - apenas UMA pode estar ativa
+  # Opção 1: Backpressure - rejeita imediatamente se fila cheia
+  backpressure:
+    enabled: false
+    max_queue: 10000  # Máximo de requests na fila (0 = sem fila)
+  
+  # Opção 2: Queue Timeout - espera até timeout, depois rejeita
+  queue_timeout:
+    enabled: false
+    timeout_ms: 500  # Espera máxima na fila em ms
+
+php:
+  binary: php
+  worker_script: worker.php
+
+logging:
+  level: info
+  format: text

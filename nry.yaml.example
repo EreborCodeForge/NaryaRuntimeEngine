@@ -1,0 +1,46 @@
+# Narya Runtime Engine Configuration
+# Copie este arquivo para .nry.yaml e ajuste conforme necessário
+
+server:
+  # Host do servidor (0.0.0.0 para aceitar conexões externas)
+  host: "0.0.0.0"
+  
+  # Porta do servidor HTTP
+  port: 8080
+  
+  # Timeout de leitura em segundos
+  read_timeout: 60
+  
+  # Timeout de escrita em segundos
+  write_timeout: 60
+  
+  # Habilita HTTP/2 (Fase 2)
+  enable_http2: true
+
+workers:
+  # Número de workers PHP
+  # Recomendado: número de CPUs ou mais para I/O bound
+  count: 4
+  
+  # Máximo de requests antes de reciclar worker
+  # Ajuda a prevenir memory leaks
+  # 0 = desabilitado (não recomendado)
+  max_requests: 1000
+  
+  # Timeout por request em segundos
+  # Requests que excedem são interrompidos
+  timeout: 30
+
+php:
+  # Caminho do binário PHP
+  binary: "php"
+  
+  # Script do worker (caminho absoluto ou relativo ao projeto)
+  worker_script: "worker.php"
+
+logging:
+  # Nível de log: debug, info, warn, error
+  level: "info"
+  
+  # Formato: text, json
+  format: "text"

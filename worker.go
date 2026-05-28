@@ -1,3 +1,6 @@
+// WorkerPool: N PHP worker processes (engine -> worker 1..N).
+// GetWorker/ReleaseWorker use channel + per-worker mutex; no global lock during Execute.
+// Each Worker is one OS process (exec); one request at a time per worker (w.mu).
 package main
 
 import (
@@ -7,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -46,6 +50,7 @@ type WorkerPool struct {
 	maxRequests   int
 	workerTimeout time.Duration
 	initialWorkers int
+	runtime        *RuntimeConfig // config dinâmica (min/max/backpressure); se nil, usa campos abaixo
 	minWorkers     int
 	maxWorkers     int
 	protocol       *Protocol
@@ -64,6 +69,9 @@ type WorkerPool struct {
 	scaleDownIdleSecs      int
 	aggressiveScaleDownSecs int
 
+	warmupStaggerMs int  // 0 = all parallel; >0 = ms between each worker at boot
+	fastWarmup     bool // warm up to max in background after min
+
 	lastStableLog   time.Time
 	lastStableLogMu sync.Mutex
 
@@ -73,6 +81,11 @@ type WorkerPool struct {
 	queueTimeoutMs       int
 
 	queuedRequests int32
+	bootTime       time.Time
+
+	busyWorkers   int32 // workers currently handling a request (for utilization %)
+	lastScaleUp   time.Time
+	lastScaleUpMu sync.Mutex
 }
 
 type WorkerPoolConfig struct {
@@ -89,10 +102,16 @@ type WorkerPoolConfig struct {
 	ScaleDownIdleSecs int
 	AggressiveScaleDownSecs int
 
+	WarmupStaggerMs int  // 0 = all parallel; >0 = ms between starting each worker
+	FastWarmup      bool // if true, warm up to max_workers in background after min
+
 	BackpressureEnabled  bool
 	BackpressureMaxQueue int
 	QueueTimeoutEnabled  bool
 	QueueTimeoutMs       int
+	KeepWarm             bool // Se true, desabilita scale-down
+
+	Runtime *RuntimeConfig // opcional: se setado, min/max/backpressure são lidos daqui em runtime
 }
 
 func NewWorkerPool(cfg WorkerPoolConfig) *WorkerPool {
@@ -112,6 +131,10 @@ func NewWorkerPool(cfg WorkerPoolConfig) *WorkerPool {
 		minWorkers = cfg.NumWorkers
 	}
 
+	runtime := cfg.Runtime
+	if runtime == nil {
+		runtime = NewRuntimeConfig(minWorkers, maxWorkers, cfg.BackpressureEnabled, cfg.BackpressureMaxQueue, cfg.KeepWarm)
+	}
 	return &WorkerPool{
 		workers:             make([]*Worker, 0, maxWorkers),
 		available:           make(chan *Worker, maxWorkers),
@@ -121,6 +144,7 @@ func NewWorkerPool(cfg WorkerPoolConfig) *WorkerPool {
 		maxRequests:         cfg.MaxRequests,
 		workerTimeout:       cfg.WorkerTimeout,
 		initialWorkers:      cfg.NumWorkers,
+		runtime:             runtime,
 		minWorkers:          minWorkers,
 		maxWorkers:          maxWorkers,
 		protocol:             NewProtocol(),
@@ -130,6 +154,8 @@ func NewWorkerPool(cfg WorkerPoolConfig) *WorkerPool {
 		lastBusyTime:           time.Now(),
 		scaleDownIdleSecs:      cfg.ScaleDownIdleSecs,
 		aggressiveScaleDownSecs: cfg.AggressiveScaleDownSecs,
+		warmupStaggerMs:        cfg.WarmupStaggerMs,
+		fastWarmup:             cfg.FastWarmup,
 		backpressureEnabled:  cfg.BackpressureEnabled,
 		backpressureMaxQueue: cfg.BackpressureMaxQueue,
 		queueTimeoutEnabled:  cfg.QueueTimeoutEnabled,
@@ -139,68 +165,80 @@ func NewWorkerPool(cfg WorkerPoolConfig) *WorkerPool {
 
 func (p *WorkerPool) Start() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if p.running {
+		p.mu.Unlock()
 		return fmt.Errorf("pool is already running")
 	}
-
 	if err := os.MkdirAll(p.sockDir, 0700); err != nil {
+		p.mu.Unlock()
 		return fmt.Errorf("failed to create socket directory: %w", err)
 	}
-
-	// Remove leftover *.sock from previous runs (orphan workers)
-	entries, err := os.ReadDir(p.sockDir)
-	if err == nil {
-		for _, e := range entries {
-			if !e.IsDir() && filepath.Ext(e.Name()) == ".sock" {
-				path := filepath.Join(p.sockDir, e.Name())
-				if errRemove := os.Remove(path); errRemove != nil && !os.IsNotExist(errRemove) {
-					p.logger.Warn("Failed to remove old socket %s: %v", path, errRemove)
-				}
-			}
+	entries, _ := os.ReadDir(p.sockDir)
+	for _, e := range entries {
+		if !e.IsDir() && filepath.Ext(e.Name()) == ".sock" {
+			_ = os.Remove(filepath.Join(p.sockDir, e.Name()))
 		}
 	}
-
-	p.logger.Info("Starting pool with %d workers (min=%d max=%d, UDS: %s)", p.initialWorkers, p.minWorkers, p.maxWorkers, p.sockDir)
-
-	for i := 0; i < p.initialWorkers; i++ {
-		worker, err := p.spawnWorker(i)
-		if err != nil {
-			p.logger.Error("Failed to create worker %d: %v", i, err)
-			continue
-		}
-		p.workers = append(p.workers, worker)
-		p.available <- worker
-		atomic.AddInt32(&p.activeWorkers, 1)
-	}
-
-	if len(p.workers) == 0 {
-		return fmt.Errorf("no workers were started")
-	}
-
-	p.nextWorkerID = int32(len(p.workers))
+	p.bootTime = time.Now()
+	p.nextWorkerID = 0
 	p.running = true
-	p.logger.Info("Pool started with %d active workers", len(p.workers))
+	p.mu.Unlock()
+
+	minW, maxW := p.runtime.GetMinWorkers(), p.runtime.GetMaxWorkers()
+	p.logger.Info("Starting pool (min=%d max=%d, UDS: %s)", minW, maxW, p.sockDir)
+	staggerMs := p.warmupStaggerMs
+	if staggerMs > 0 {
+		p.logger.Info("Spawning %d min workers with %dms stagger (faster ready under load)", minW, staggerMs)
+	} else {
+		p.logger.Info("Spawning %d min workers in parallel; scale-up to max on load (≈70%% utilization)", minW)
+	}
+
+	for i := 0; i < minW; i++ {
+		if i > 0 && staggerMs > 0 {
+			time.Sleep(time.Duration(staggerMs) * time.Millisecond)
+		}
+		go p.addWorker()
+	}
+
+	if p.fastWarmup && minW < maxW {
+		go p.warmUpToMax()
+	}
 
 	go p.scalerLoop()
+	go p.healthMonitor()
 
-	if p.backpressureEnabled {
-		p.logger.Info("Backpressure enabled: max_queue=%d", p.backpressureMaxQueue)
+	if p.runtime.GetBackpressureEnabled() && p.queueTimeoutEnabled {
+		p.logger.Info("Backpressure + Queue timeout: max_queue=%d, timeout=%dms", p.runtime.GetBackpressureMaxQueue(), p.queueTimeoutMs)
+	} else if p.runtime.GetBackpressureEnabled() {
+		p.logger.Info("Backpressure enabled: max_queue=%d", p.runtime.GetBackpressureMaxQueue())
 	} else if p.queueTimeoutEnabled {
 		p.logger.Info("Queue timeout enabled: timeout=%dms", p.queueTimeoutMs)
 	} else {
 		p.logger.Info("No queue limit (default mode)")
 	}
 
-	go p.healthMonitor()
-
 	return nil
+}
+
+// warmUpToMax sobe (max - min) workers em background com stagger; usado quando fast_warmup: true.
+func (p *WorkerPool) warmUpToMax() {
+	staggerMs := p.warmupStaggerMs
+	if staggerMs <= 0 {
+		staggerMs = 100 // default para não disparar todos de uma vez
+	}
+	minW, maxW := p.runtime.GetMinWorkers(), p.runtime.GetMaxWorkers()
+	for i := minW; i < maxW; i++ {
+		time.Sleep(time.Duration(staggerMs) * time.Millisecond)
+		go p.addWorker()
+	}
 }
 
 func (p *WorkerPool) spawnWorker(id int) (*Worker, error) {
 	sockPath := filepath.Join(p.sockDir, fmt.Sprintf("worker-%03d.sock", id))
 
+	if err := os.MkdirAll(p.sockDir, 0700); err != nil {
+		return nil, fmt.Errorf("failed to create socket directory: %w", err)
+	}
 	if err := os.Remove(sockPath); err != nil && !os.IsNotExist(err) {
 		p.logger.Warn("Error removing old socket %s: %v", sockPath, err)
 	}
@@ -213,6 +251,19 @@ func (p *WorkerPool) spawnWorker(id int) (*Worker, error) {
 	if err := os.Chmod(sockPath, 0600); err != nil {
 		listener.Close()
 		return nil, fmt.Errorf("failed to set socket permissions: %w", err)
+	}
+
+	// Garantir que o socket file existe no filesystem antes de iniciar PHP
+	// (evita race condition onde PHP inicia antes do kernel criar o file)
+	// Normalmente o socket existe imediatamente; o loop é só fallback para edge cases.
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(sockPath); err == nil {
+			break
+		}
+		if i == 0 {
+			continue // primeira tentativa: retry imediato sem sleep
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	cmd := exec.Command(p.phpBinary, p.workerScript, "--sock", sockPath)
@@ -270,7 +321,7 @@ func (p *WorkerPool) spawnWorker(id int) (*Worker, error) {
 		listener.Close()
 		os.Remove(sockPath)
 		return nil, fmt.Errorf("failed to accept connection: %w", err)
-	case <-time.After(10 * time.Second):
+	case <-time.After(60 * time.Second):
 		cmd.Process.Kill()
 		listener.Close()
 		os.Remove(sockPath)
@@ -281,67 +332,45 @@ func (p *WorkerPool) spawnWorker(id int) (*Worker, error) {
 }
 
 func (p *WorkerPool) GetWorker(ctx context.Context) (*Worker, error) {
-
-	if p.backpressureEnabled {
-		currentQueue := atomic.LoadInt32(&p.queuedRequests)
-		if int(currentQueue) >= p.backpressureMaxQueue {
-			return nil, fmt.Errorf("service unavailable: queue full (%d/%d)", currentQueue, p.backpressureMaxQueue)
-		}
+	// Fast path: tentar obter worker imediatamente sem entrar na fila
+	if worker := p.tryGetWorker(); worker != nil {
+		return worker, nil
 	}
 
-	atomic.AddInt32(&p.queuedRequests, 1)
-	defer atomic.AddInt32(&p.queuedRequests, -1)
+	// Slow path: nenhum worker disponível, verificar backpressure antes de enfileirar
+	backpressureEnabled := p.runtime.GetBackpressureEnabled()
+	backpressureMaxQueue := p.runtime.GetBackpressureMaxQueue()
 
-	select {
-	case worker := <-p.available:
-		if worker == nil {
-			return nil, fmt.Errorf("pool stopped")
-		}
-
-		worker.mu.Lock()
-		isDead := worker.state == WorkerStateDead
-
-		if !isDead && worker.cmd != nil && worker.cmd.ProcessState != nil && worker.cmd.ProcessState.Exited() {
-			isDead = true
-			worker.state = WorkerStateDead
-		}
-
-		if !isDead && worker.conn != nil {
-			worker.conn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
-			buf := make([]byte, 1)
-			_, err := worker.conn.Read(buf)
-			worker.conn.SetReadDeadline(time.Time{})
-			if err != nil && !isTimeout(err) {
-				isDead = true
-				worker.state = WorkerStateDead
+	// Backpressure check-before-increment: evita aceitar mais que o limite
+	if backpressureEnabled && backpressureMaxQueue > 0 {
+		for {
+			current := atomic.LoadInt32(&p.queuedRequests)
+			if current >= int32(backpressureMaxQueue) {
+				return nil, fmt.Errorf("service unavailable: queue full (%d/%d)", current, backpressureMaxQueue)
 			}
+			if atomic.CompareAndSwapInt32(&p.queuedRequests, current, current+1) {
+				break
+			}
+			// CAS falhou, retry (outro request entrou primeiro)
 		}
-		worker.mu.Unlock()
-
-		if isDead {
-
-			go func(w *Worker) {
-				newWorker, err := p.respawnWorker(w)
-				if err != nil {
-					p.logger.Error("Failed to respawn worker %d: %v", w.ID, err)
-					return
-				}
-				p.available <- newWorker
-			}(worker)
-		} else {
-			worker.mu.Lock()
-			worker.state = WorkerStateBusy
-			worker.lastActiveTime = time.Now()
-			worker.mu.Unlock()
-			return worker, nil
-		}
-	default:
-
+		defer atomic.AddInt32(&p.queuedRequests, -1)
+	} else if backpressureEnabled {
+		// Sem limite, apenas conta para métricas
+		atomic.AddInt32(&p.queuedRequests, 1)
+		defer atomic.AddInt32(&p.queuedRequests, -1)
 	}
 
+	// Scaling reativo: tentar subir worker se abaixo do max
+	p.mu.RLock()
+	n := len(p.workers)
+	p.mu.RUnlock()
+	if n < p.runtime.GetMaxWorkers() {
+		go p.addWorker()
+	}
+
+	// Preparar contexto com timeout de fila (se habilitado)
 	var queueCtx context.Context
 	var queueCancel context.CancelFunc
-
 	if p.queueTimeoutEnabled {
 		queueCtx, queueCancel = context.WithTimeout(ctx, time.Duration(p.queueTimeoutMs)*time.Millisecond)
 		defer queueCancel()
@@ -349,70 +378,74 @@ func (p *WorkerPool) GetWorker(ctx context.Context) (*Worker, error) {
 		queueCtx = ctx
 	}
 
-	p.mu.RLock()
-	n := len(p.workers)
-	p.mu.RUnlock()
-	if n < p.maxWorkers {
-		go p.addWorker()
-	}
-
+	// Loop de espera por worker disponível
 	for {
 		select {
 		case worker := <-p.available:
 			if worker == nil {
 				return nil, fmt.Errorf("pool stopped")
 			}
-
-			worker.mu.Lock()
-			isDead := worker.state == WorkerStateDead
-
-			if !isDead && worker.cmd != nil && worker.cmd.ProcessState != nil && worker.cmd.ProcessState.Exited() {
-				isDead = true
-				worker.state = WorkerStateDead
+			if w := p.validateAndPrepareWorker(worker); w != nil {
+				return w, nil
 			}
-
-			if !isDead && worker.conn != nil {
-
-				worker.conn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
-				buf := make([]byte, 1)
-				_, err := worker.conn.Read(buf)
-				worker.conn.SetReadDeadline(time.Time{})
-
-				if err != nil && !isTimeout(err) {
-					isDead = true
-					worker.state = WorkerStateDead
-				}
-			}
-			worker.mu.Unlock()
-
-			if isDead {
-
-				go func(w *Worker) {
-					newWorker, err := p.respawnWorker(w)
-					if err != nil {
-						p.logger.Error("Failed to respawn worker %d: %v", w.ID, err)
-						return
-					}
-					p.available <- newWorker
-				}(worker)
-
-				continue
-			}
-
-			worker.mu.Lock()
-			worker.state = WorkerStateBusy
-			worker.lastActiveTime = time.Now()
-			worker.mu.Unlock()
-			return worker, nil
+			// Worker morto, respawn em background, continua esperando
+			continue
 
 		case <-queueCtx.Done():
-
 			if p.queueTimeoutEnabled && queueCtx.Err() == context.DeadlineExceeded {
 				return nil, fmt.Errorf("service unavailable: queue timeout (%dms)", p.queueTimeoutMs)
 			}
 			return nil, ctx.Err()
 		}
 	}
+}
+
+// tryGetWorker tenta obter um worker sem bloquear. Retorna nil se nenhum disponível.
+func (p *WorkerPool) tryGetWorker() *Worker {
+	select {
+	case worker := <-p.available:
+		if worker == nil {
+			return nil
+		}
+		if w := p.validateAndPrepareWorker(worker); w != nil {
+			return w
+		}
+		// Worker morto, respawn em background, retorna nil para entrar no slow path
+		return nil
+	default:
+		return nil
+	}
+}
+
+// validateAndPrepareWorker verifica se o worker está vivo e o prepara para uso.
+// Se morto, agenda respawn e retorna nil.
+func (p *WorkerPool) validateAndPrepareWorker(worker *Worker) *Worker {
+	worker.mu.Lock()
+	isDead := worker.state == WorkerStateDead
+	if !isDead && worker.cmd != nil && worker.cmd.ProcessState != nil && worker.cmd.ProcessState.Exited() {
+		isDead = true
+		worker.state = WorkerStateDead
+	}
+	worker.mu.Unlock()
+
+	if isDead {
+		go func(w *Worker) {
+			newWorker, err := p.respawnWorker(w)
+			if err != nil {
+				p.logger.Error("Failed to respawn worker %d: %v", w.ID, err)
+				return
+			}
+			p.available <- newWorker
+		}(worker)
+		return nil
+	}
+
+	worker.mu.Lock()
+	worker.state = WorkerStateBusy
+	worker.lastActiveTime = time.Now()
+	worker.mu.Unlock()
+	atomic.AddInt32(&p.busyWorkers, 1)
+	return worker
 }
 
 
@@ -425,11 +458,15 @@ func isTimeout(err error) bool {
 
 
 func (p *WorkerPool) ReleaseWorker(worker *Worker, resp *Response) {
+	if atomic.AddInt32(&p.busyWorkers, -1) < 0 {
+		atomic.StoreInt32(&p.busyWorkers, 0)
+	}
+
 	worker.mu.Lock()
 	currentState := worker.state
 	worker.requestCount++
 	count := worker.requestCount
-	
+
 	if currentState == WorkerStateDead {
 		worker.mu.Unlock()
 		p.logger.Info("Worker %d is dead, respawning...", worker.ID)
@@ -504,6 +541,7 @@ func (p *WorkerPool) respawnWorker(old *Worker) (*Worker, error) {
 
 	newWorker, err := p.spawnWorker(old.ID)
 	if err != nil {
+		atomic.AddInt32(&p.activeWorkers, 1)
 		return nil, err
 	}
 
@@ -521,49 +559,55 @@ func (p *WorkerPool) respawnWorker(old *Worker) (*Worker, error) {
 }
 
 func (p *WorkerPool) addWorker() {
-
 	for {
 		cur := atomic.LoadInt32(&p.activeWorkers)
-		if cur >= int32(p.maxWorkers) {
+		if cur >= int32(p.runtime.GetMaxWorkers()) {
 			return
 		}
-
 		if atomic.CompareAndSwapInt32(&p.activeWorkers, cur, cur+1) {
 			break
 		}
-
 	}
 
 	id := int(atomic.AddInt32(&p.nextWorkerID, 1) - 1)
 
-	worker, err := p.spawnWorker(id)
-	if err != nil {
-		atomic.AddInt32(&p.activeWorkers, -1)
-		p.logger.Error("Scale-up: failed to create worker %d: %v", id, err)
-		return
-	}
+	// Handshake em background: worker entra no pool quando ficar pronto
+	go func() {
+		worker, err := p.spawnWorker(id)
+		if err != nil {
+			atomic.AddInt32(&p.activeWorkers, -1)
+			p.logger.Error("Scale-up: failed to create worker %d: %v", id, err)
+			return
+		}
+		p.mu.Lock()
+		p.workers = append(p.workers, worker)
+		currentTotal := len(p.workers)
+		p.mu.Unlock()
 
-	p.mu.Lock()
-	p.workers = append(p.workers, worker)
-	currentTotal := len(p.workers)
-	p.mu.Unlock()
-
-	select {
-	case p.available <- worker:
-		currentActive := atomic.LoadInt32(&p.activeWorkers)
-		p.logger.Info("Scale-up: worker %d (PID %d) added; active=%d, total_slots=%d", worker.ID, worker.Pid, currentActive, currentTotal)
-	default:
-
-		p.destroyWorker(worker)
-		atomic.AddInt32(&p.activeWorkers, -1)
-	}
+		select {
+		case p.available <- worker:
+			currentActive := atomic.LoadInt32(&p.activeWorkers)
+			p.logger.Info("Scale-up: worker %d (PID %d) added; active=%d, total_slots=%d", worker.ID, worker.Pid, currentActive, currentTotal)
+		default:
+			p.destroyWorker(worker)
+			atomic.AddInt32(&p.activeWorkers, -1)
+		}
+	}()
 }
 
 
 func (p *WorkerPool) removeWorker(w *Worker) {
+	// Cooldown de boot: não scale-down nos primeiros 30s
+	if time.Since(p.bootTime) < 30*time.Second {
+		select {
+		case p.available <- w:
+		default:
+		}
+		return
+	}
 
 	p.mu.Lock()
-	if len(p.workers) <= p.minWorkers {
+	if len(p.workers) <= p.runtime.GetMinWorkers() {
 		p.mu.Unlock()
 		select {
 		case p.available <- w:
@@ -580,25 +624,17 @@ func (p *WorkerPool) removeWorker(w *Worker) {
 	currentTotal := len(p.workers)
 	p.mu.Unlock()
 
+	minW := p.runtime.GetMinWorkers()
 	p.destroyWorker(w)
 	newActive := atomic.AddInt32(&p.activeWorkers, -1)
-	if newActive < int32(p.minWorkers) {
-		atomic.StoreInt32(&p.activeWorkers, int32(p.minWorkers))
-		newActive = int32(p.minWorkers)
+	if newActive < int32(minW) {
+		atomic.StoreInt32(&p.activeWorkers, int32(minW))
+		newActive = int32(minW)
 	}
 	p.logger.Info("Scale-down: worker %d (PID %d) removed; active=%d, total_slots=%d", w.ID, w.Pid, newActive, currentTotal)
 }
 
 func (p *WorkerPool) destroyWorker(w *Worker) {
-	sockPath := w.sockPath
-	defer func() {
-		if sockPath != "" {
-			if err := os.Remove(sockPath); err != nil && !os.IsNotExist(err) {
-				p.logger.Warn("Failed to remove socket %s: %v", sockPath, err)
-			}
-		}
-	}()
-
 	if w.conn != nil {
 		w.conn.Close()
 	}
@@ -615,10 +651,14 @@ func (p *WorkerPool) destroyWorker(w *Worker) {
 			w.cmd.Process.Kill()
 		}
 	}
+	os.Remove(w.sockPath)
 }
 
+const scaleUpUtilizationThreshold = 0.70 // scale-up when ~70% of workers are busy
+const scaleUpCooldownMs = 400           // min ms between adding one worker (sequential, no thundering)
+
 func (p *WorkerPool) scalerLoop() {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(2 * time.Second) // check more often for scale-up responsiveness
 	defer ticker.Stop()
 
 	for {
@@ -626,6 +666,43 @@ func (p *WorkerPool) scalerLoop() {
 		case <-p.ctx.Done():
 			return
 		case <-ticker.C:
+			p.mu.RLock()
+			total := len(p.workers)
+			p.mu.RUnlock()
+			min := p.runtime.GetMinWorkers()
+			max := p.runtime.GetMaxWorkers()
+
+			busy := atomic.LoadInt32(&p.busyWorkers)
+			if busy < 0 {
+				busy = 0
+			}
+
+			// Scale-up proativo: quando ~70% dos workers estão em uso e ainda há capacidade, sobe 1 worker por vez
+			if total >= min && total < max && total > 0 {
+				utilization := float64(busy) / float64(total)
+				if utilization >= scaleUpUtilizationThreshold {
+					p.lastScaleUpMu.Lock()
+					canScaleUp := time.Since(p.lastScaleUp) >= scaleUpCooldownMs*time.Millisecond
+					if canScaleUp {
+						p.lastScaleUp = time.Now()
+						p.lastScaleUpMu.Unlock()
+						go p.addWorker()
+					} else {
+						p.lastScaleUpMu.Unlock()
+					}
+				}
+			}
+
+			// Se keep_warm ativo, ignora todo scale-down (workers sempre quentes)
+			if p.runtime.GetKeepWarm() {
+				continue
+			}
+
+			// Não fazer scale-down imediato após boot (evita thrashing)
+			if time.Since(p.bootTime) < 30*time.Second {
+				continue
+			}
+
 			p.lastBusyTimeMu.Lock()
 			idleSince := time.Since(p.lastBusyTime)
 			p.lastBusyTimeMu.Unlock()
@@ -634,12 +711,7 @@ func (p *WorkerPool) scalerLoop() {
 				continue
 			}
 
-			p.mu.RLock()
-			n := len(p.workers)
-			min := p.minWorkers
-			max := p.maxWorkers
-			p.mu.RUnlock()
-			if n <= min {
+			if total <= min {
 				thresholdSec := p.aggressiveScaleDownSecs
 				if thresholdSec <= 0 {
 					thresholdSec = p.scaleDownIdleSecs
@@ -648,6 +720,9 @@ func (p *WorkerPool) scalerLoop() {
 					p.lastStableLogMu.Lock()
 					if time.Since(p.lastStableLog) >= 30*time.Second {
 						active := atomic.LoadInt32(&p.activeWorkers)
+						if active < 0 {
+							active = 0
+						}
 						p.logger.Info("Pool idle and stable: %d active workers (min=%d, max=%d)", active, min, max)
 						p.lastStableLog = time.Now()
 					}
@@ -712,56 +787,19 @@ func (p *WorkerPool) Execute(ctx context.Context, req *Request) (*Response, erro
 		return nil, fmt.Errorf("failed to get worker: %w", err)
 	}
 
-	internalTimeout := p.workerTimeout + 5*time.Second
+	req.WorkerID = strconv.Itoa(worker.ID)
+	req.RuntimeVersion = RuntimeVersion
 
-	resultCh := make(chan *Response, 1)
-	errCh := make(chan error, 1)
-
-	go func() {
-		resp, err := worker.Execute(req)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		resultCh <- resp
-	}()
-
-	select {
-	case resp := <-resultCh:
-		p.ReleaseWorker(worker, resp)
-		return resp, nil
-		
-	case err := <-errCh:
+	resp, err := worker.Execute(req)
+	if err != nil {
 		worker.mu.Lock()
 		worker.state = WorkerStateDead
 		worker.mu.Unlock()
 		p.ReleaseWorker(worker, nil)
 		return nil, err
-		
-	case <-ctx.Done():
-		go func() {
-			select {
-			case resp := <-resultCh:
-				p.ReleaseWorker(worker, resp)
-			case err := <-errCh:
-				worker.mu.Lock()
-				worker.state = WorkerStateDead
-				worker.mu.Unlock()
-				p.ReleaseWorker(worker, nil)
-				p.logger.Debug("Worker %d error after client closed: %v", worker.ID, err)
-			case <-time.After(internalTimeout):
-				p.logger.Warn("Worker %d real timeout, will be restarted", worker.ID)
-				worker.mu.Lock()
-				worker.state = WorkerStateDead
-				worker.mu.Unlock()
-				if worker.cmd.Process != nil {
-					worker.cmd.Process.Kill()
-				}
-				p.ReleaseWorker(worker, nil)
-			}
-		}()
-		return nil, fmt.Errorf("client cancelled request")
 	}
+	p.ReleaseWorker(worker, resp)
+	return resp, nil
 }
 
 func (w *Worker) Execute(req *Request) (*Response, error) {
@@ -772,14 +810,6 @@ func (w *Worker) Execute(req *Request) (*Response, error) {
 		return nil, fmt.Errorf("connection not established")
 	}
 
-	if req.TimeoutMs > 0 {
-		deadline := time.Now().Add(time.Duration(req.TimeoutMs) * time.Millisecond)
-		w.conn.SetDeadline(deadline)
-	}
-
-	req.WorkerID = w.ID
-	req.RuntimeVersion = RuntimeVersion
-
 	if err := w.protocol.SendRequest(w.conn, req); err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
@@ -788,8 +818,6 @@ func (w *Worker) Execute(req *Request) (*Response, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
-
-	w.conn.SetDeadline(time.Time{})
 
 	return resp, nil
 }
@@ -834,7 +862,11 @@ func (p *WorkerPool) checkAndRespawnDeadWorkers() {
 	if len(deadWorkers) > 0 {
 		p.logger.Info("Respawning %d dead workers...", len(deadWorkers))
 		var wg sync.WaitGroup
-		for _, worker := range deadWorkers {
+		for i, worker := range deadWorkers {
+			// Stagger: evita subir 16 Laravel ao mesmo tempo (evita thrashing e timeout)
+			if i > 0 {
+				time.Sleep(400 * time.Millisecond)
+			}
 			wg.Add(1)
 			go func(w *Worker) {
 				defer wg.Done()
@@ -933,8 +965,8 @@ func (p *WorkerPool) Stats() PoolStats {
 		ActiveWorkers:    int32(len(workers)),
 		AvailableWorkers: int32(len(p.available)),
 		WorkersDetail:    detail,
-		MinWorkers:       p.minWorkers,
-		MaxWorkers:       p.maxWorkers,
+		MinWorkers:       p.runtime.GetMinWorkers(),
+		MaxWorkers:       p.runtime.GetMaxWorkers(),
 	}
 }
 

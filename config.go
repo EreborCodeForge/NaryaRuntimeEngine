@@ -26,6 +26,8 @@ type ServerConfig struct {
 	// Campos para parsing YAML (inteiros em segundos)
 	ReadTimeoutSecs  int `yaml:"read_timeout"`
 	WriteTimeoutSecs int `yaml:"write_timeout"`
+	// Backlog de conexões TCP (default: 4096). Aumentar para high-throughput.
+	Backlog int `yaml:"backlog"`
 }
 
 // WorkersConfig configuração dos workers
@@ -35,10 +37,20 @@ type WorkersConfig struct {
 	MaxWorkers  int           `yaml:"max_workers"`  // Teto de workers; 0 = usa count
 	ScaleDownIdleSecs int     `yaml:"scale_down_idle_secs"` // Segundos ociosos para scale-down suave; 0 = desligado
 	AggressiveScaleDownSecs int `yaml:"aggressive_scale_down_secs"` // Após Xs ocioso, derruba tudo até o mínimo
+	KeepWarm    bool          `yaml:"keep_warm"`    // Se true, ignora scale-down e mantém todos os workers ativos
 	MaxRequests int           `yaml:"max_requests"`
 	Timeout     time.Duration `yaml:"-"`
 	// Campo para parsing YAML (inteiro em segundos)
 	TimeoutSecs int `yaml:"timeout"`
+
+	// Diretório dos sockets UDS (vazio = /tmp/narya). Em Docker use um path no projeto (ex: /var/www/bootstrap/cache/narya).
+	SocketDir string `yaml:"socket_dir"`
+
+	// Warmup: 0 = todos os min_workers sobem em paralelo (mais rápido para poucos workers)
+	// >0 = intervalo em ms entre subir cada worker (reduz contenção, pool fica "pronto" mais cedo com muitos workers)
+	WarmupStaggerMs int `yaml:"warmup_stagger_ms"`
+	// Se true, após os min_workers sobe o restante até max_workers em background (pool cheio mais cedo)
+	FastWarmup bool `yaml:"fast_warmup"`
 
 	// Estratégias de overflow (mutuamente exclusivas)
 	// backpressure: rejeita imediatamente com 503 se fila cheia
@@ -84,6 +96,7 @@ func DefaultConfig() *Config {
 			ReadTimeoutSecs:  60,
 			WriteTimeoutSecs: 60,
 			EnableHTTP2:      true,
+			Backlog:          4096,
 		},
 		Workers: WorkersConfig{
 			Count:       4,
@@ -139,6 +152,11 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.Workers.MaxWorkers = cfg.Workers.Count
 	}
 
+	// Backlog padrão se não especificado
+	if cfg.Server.Backlog <= 0 {
+		cfg.Server.Backlog = 4096
+	}
+
 	return cfg, nil
 }
 
@@ -163,10 +181,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("timeout de worker muito baixo: %v", c.Workers.Timeout)
 	}
 
-	// Validação: backpressure e queue_timeout são mutuamente exclusivos
-	if c.Workers.Backpressure.Enabled && c.Workers.QueueTimeout.Enabled {
-		return fmt.Errorf("backpressure and queue_timeout are mutually exclusive - enable only one")
-	}
+	// Backpressure e queue_timeout podem ser usados juntos:
+	// - Backpressure: rejeita se fila cheia (proteção contra avalanche)
+	// - Queue timeout: rejeita se esperou demais (proteção contra latência alta)
 
 	// Validação de valores
 	if c.Workers.Backpressure.Enabled && c.Workers.Backpressure.MaxQueue < 0 {

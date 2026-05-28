@@ -16,6 +16,7 @@ const (
 	LogLevelInfo
 	LogLevelWarn
 	LogLevelError
+	LogLevelSilent // Desabilita todos os logs
 )
 
 // Logger estrutura de logging
@@ -45,9 +46,16 @@ func parseLogLevel(level string) LogLevel {
 		return LogLevelWarn
 	case "error":
 		return LogLevelError
+	case "silent", "none", "off":
+		return LogLevelSilent
 	default:
 		return LogLevelInfo
 	}
+}
+
+// IsDebugEnabled retorna true se debug está habilitado (evita avaliação de argumentos)
+func (l *Logger) IsDebugEnabled() bool {
+	return l.level <= LogLevelDebug
 }
 
 // log formata e escreve a mensagem
