@@ -3,7 +3,7 @@
 
 BINARY_NAME=narya
 VERSION=1.0.0
-BUILD_DIR=../../build
+BUILD_DIR=./build
 GO_FILES=$(wildcard *.go)
 
 # Flags de build
