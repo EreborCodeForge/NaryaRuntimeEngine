@@ -54,14 +54,14 @@ Narya keeps **persistent PHP workers** that:
 - Run bootstrap **once**
 - Keep database connections **open**
 - Keep the DI container **initialized**
-- Handle requests in **microseconds**
+- Handle requests with minimal per-request overhead
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                      NARYA RUNTIME                           │
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
-│   ┌─────────┐    HTTP/2     ┌──────────────────────────┐    │
+│   ┌─────────┐               ┌──────────────────────────┐    │
 │   │ Client  │ ────────────► │     Go HTTP Server       │    │
 │   └─────────┘               │  (Pool Manager, Router)   │    │
 │                             └───────────┬──────────────┘    │
@@ -85,18 +85,18 @@ Narya keeps **persistent PHP workers** that:
 
 ### Components
 
-| Component      | Language | Responsibility                                      |
-|----------------|----------|-----------------------------------------------------|
-| **HTTP Server**| Go       | Accepts HTTP/1.1 and HTTP/2, manages worker pool   |
-| **Worker Pool**| Go       | Spawns, monitors, and recycles PHP workers         |
-| **Protocol**   | Go/PHP   | MessagePack serialization with binary framing      |
-| **Worker**     | PHP   | Orchestrator: UDS bridge, state reset, error handling |
-| **CLI**        | PHP   | Interface to start and configure the runtime       |
+| Component       | Language | Responsibility |
+|-----------------|----------|----------------|
+| **HTTP Server** | Go       | Accepts HTTP requests, routes app traffic and `/narya/*` ops endpoints |
+| **Worker Pool** | Go       | Spawns, scales, monitors, and recycles PHP workers |
+| **Protocol**    | Go/PHP   | MessagePack serialization with binary framing |
+| **Worker**      | PHP (SDK)| Orchestrator: UDS bridge, state reset, error handling |
+| **Runtime CLI** | Go       | Start/stop server, read config, hot-update pool settings |
 
 ### Tech Stack
 
 - **Go 1.21+**: HTTP server, concurrency, process management
-- **PHP 8.0+**: Persistent workers, application logic
+- **PHP 8.0+** with `ext-msgpack`: Persistent workers, application logic
 - **Unix Domain Sockets**: Low-latency inter-process communication
 - **MessagePack**: Binary serialization (smaller than JSON)
 
@@ -126,13 +126,14 @@ echo "extension=msgpack.so" >> /etc/php/8.x/cli/php.ini
 ```bash
 make build
 
-# Or for a specific target
-make build-linux
+# Cross-compile for Linux
+make linux
 ```
 
-### 3. Verify installation
+### 3. Configure and verify
 
 ```bash
+cp nry.yaml.example nry.yaml
 php -m | grep msgpack
 ./narya --version
 ```
@@ -144,22 +145,55 @@ php -m | grep msgpack
 ### Start the runtime
 
 ```bash
-# With config file
-./narya -config=.rr.yaml
+# Default config file: .nry.yaml (or nry.yaml in project root)
+./narya -config=nry.yaml
 
+# Override flags
+./narya -config=nry.yaml -host=0.0.0.0 -port=8888 -workers=4
 ```
+
+The server listens for **application traffic** on `/` and exposes **runtime endpoints** under `/narya/*`.
+
+### Runtime endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /narya/health` | Pool health (503 if no workers) |
+| `GET /narya/metrics` | Prometheus text metrics |
+| `GET /narya/debug/workers` | Worker IDs, PIDs, state, request counts |
+| `GET /narya/config` | Current runtime config (min/max, backpressure, keep_warm) |
+| `PATCH /narya/config` | Hot-update runtime config (JSON body) |
 
 ### Quick test
 
 ```bash
-curl http://localhost:8888/health
+curl -s http://localhost:8888/narya/health
+curl -s http://localhost:8888/narya/debug/workers
+curl -s http://localhost:8888/narya/metrics
 ```
+
+### Runtime config CLI (while server is running)
+
+```bash
+narya -config=nry.yaml config get
+narya -config=nry.yaml config set min_workers=2 max_workers=8 keep_warm=true
+```
+
+### Graceful shutdown
+
+Send `SIGINT` or `SIGTERM` (Ctrl+C). The server drains HTTP connections (30s timeout) and stops the worker pool.
 
 ---
 
 ## Integration with PHP Applications
 
-Narya’s PHP side is a **library**: use it in any project (Laravel, Slim, Symfony, plain PHP). Install with `composer require narya/runtime`, implement a handler `(array $request): array`, and instantiate **`Worker`** (which implements the UDS bridge internally). The Go runtime starts each process with: `php worker.php --sock /path/to.sock`. The **Worker** class orchestrates the request loop, state reset between requests, and error handling.
+Narya's PHP side is the **`narya-php-sdk`**: use it in any project (Laravel, Slim, Symfony, plain PHP). Install via Composer, implement your application worker (or handler), and instantiate **`Worker`** (UDS bridge, reset, error handling).
+
+The Go runtime starts each process with:
+
+```bash
+php worker.php --sock /path/to.sock --max-requests 300
+```
 
 See the [Example API](#example-api) section for a minimal worker script.
 
@@ -167,80 +201,67 @@ See the [Example API](#example-api) section for a minimal worker script.
 
 ## Configuration
 
-Copy `.rr.yaml.example` to `.rr.yaml` and adjust as needed.
+Copy [`nry.yaml.example`](nry.yaml.example) to `nry.yaml` (or `.nry.yaml`) and adjust as needed.
 
 ---
 
 ### `server` — HTTP server
 
-Controls where and how the Go HTTP server listens. All incoming HTTP requests hit this server before being dispatched to PHP workers over UDS.
-
-| Option          | Type    | Default | Context |
-|-----------------|---------|---------|---------|
-| **`host`**      | string  | `0.0.0.0` | Bind address. Use `0.0.0.0` to accept external connections, or `127.0.0.1` to listen only on localhost (e.g. behind a reverse proxy). |
-| **`port`**      | int     | `8888`  | TCP port. Must be free on the machine. |
-| **`read_timeout`**  | int (seconds) | `60` | Max time the server waits for the client to send the request body. Prevents slow clients from holding connections. Increase for large uploads or slow networks. |
-| **`write_timeout`** | int (seconds) | `60` | Max time the server waits to write the response to the client. Prevents slow clients from blocking. Increase if responses are large or clients are slow. |
-| **`enable_http2`**  | bool   | `true`  | Enables HTTP/2 on the same port. Useful for multiplexing and better performance when clients support it. |
+| Option | Type | Default | Context |
+|--------|------|---------|---------|
+| **`host`** | string | `0.0.0.0` | Bind address |
+| **`port`** | int | `8888` | TCP port |
+| **`read_timeout`** | int (seconds) | `60` | Max time to read the request body |
+| **`write_timeout`** | int (seconds) | `60` | Max time to write the response |
+| **`enable_http2`** | bool | `true` | Reserved for HTTP/2 (not fully wired yet) |
+| **`backlog`** | int | `4096` | TCP listen backlog hint |
 
 ---
 
 ### `workers` — PHP worker pool
 
-Controls how many PHP processes run, how they scale, when they are recycled, and how overflow (more requests than available workers) is handled.
-
 | Option | Type | Default | Context |
 |--------|------|---------|---------|
-| **`count`** | int | `4` | **Initial and target** number of PHP workers. The pool keeps this many workers under normal load. Must satisfy `min_workers <= count <= max_workers`. |
-| **`min_workers`** | int | same as `count` | Minimum workers kept alive when scaling down. Reduces idle processes in low traffic; workers are still available (warm). Set lower than `count` to allow scale-down. |
-| **`max_workers`** | int | same as `count` | Maximum workers allowed when scaling up. Caps resource usage under spikes. Set higher than `count` to allow scale-up. |
-| **`scale_down_idle_secs`** | int (seconds) | `0` (disabled) | After this many seconds with no work, the pool scales down **one worker at a time**. Use for gradual scale-down (e.g. `30`). `0` disables smooth scale-down. |
-| **`aggressive_scale_down_secs`** | int (seconds) | — | After this many seconds idle, the pool scales down **all at once** to `min_workers`. Use when traffic drops for a long time (e.g. `10`) to free resources quickly. |
-| **`max_requests`** | int | `1000` | After a worker handles this many requests, it is **recycled** (process restarted). Helps avoid memory leaks and long-lived state; tune per app. `0` = no limit (not recommended). |
-| **`timeout`** | int (seconds) | `30` | **Per-request** timeout. If a PHP worker does not respond within this time, the request is aborted and the worker may be recycled. Increase for slow endpoints. |
+| **`count`** | int | `4` | Target worker count; must satisfy `min_workers <= count <= max_workers` |
+| **`min_workers`** | int | same as `count` | Minimum workers when scaling down |
+| **`max_workers`** | int | same as `count` | Maximum workers when scaling up |
+| **`keep_warm`** | bool | `false` | If `true`, disables scale-down (workers stay hot) |
+| **`scale_down_idle_secs`** | int | `0` | Idle seconds before scaling down one worker at a time |
+| **`aggressive_scale_down_secs`** | int | — | Idle seconds before scaling down to `min_workers` at once |
+| **`max_requests`** | int | `1000` | Recycle worker after N requests; passed to PHP as `--max-requests` |
+| **`timeout`** | int (seconds) | `30` | Per-request timeout (UDS deadline) |
+| **`socket_dir`** | string | `/tmp/narya` | UDS socket directory (use a project path in Docker) |
+| **`warmup_stagger_ms`** | int | `0` | Ms between spawning each worker at boot (`0` = parallel) |
+| **`fast_warmup`** | bool | `false` | Warm up to `max_workers` in background after `min_workers` |
 
 #### Overflow strategy — only one may be enabled
 
-When all workers are busy, new requests are queued (or rejected). You choose one strategy:
-
-| Option | Type | Context |
-|--------|------|---------|
-| **`backpressure`** | object | **Reject immediately** when the queue is full. Use when you prefer fast failure (503) over waiting. |
-| **`backpressure.enabled`** | bool | `false` | Set `true` to enable backpressure. |
-| **`backpressure.max_queue`** | int | — | Max requests allowed in the queue. When exceeded, new requests get 503. `0` = no queue (reject as soon as all workers are busy). |
-| **`queue_timeout`** | object | **Wait up to a limit** in the queue; if not dispatched in time, return 503. Use when you accept a short wait for availability. |
-| **`queue_timeout.enabled`** | bool | `false` | Set `true` to enable queue timeout. |
-| **`queue_timeout.timeout_ms`** | int (ms) | — | Max time a request may wait in the queue. After this, the client receives 503. |
-
-**Rule:** Only one of `backpressure` and `queue_timeout` may have `enabled: true`. If both are off, the server uses default queuing behavior (no hard limit or timeout).
+| Option | Context |
+|--------|---------|
+| **`backpressure`** | Reject immediately when queue is full (503) |
+| **`backpressure.enabled`** | Enable backpressure |
+| **`backpressure.max_queue`** | Max queued requests (`0` = no queue) |
+| **`queue_timeout`** | Wait in queue up to `timeout_ms`, then 503 |
+| **`queue_timeout.enabled`** | Enable queue timeout |
+| **`queue_timeout.timeout_ms`** | Max wait time in queue (ms) |
 
 ---
 
-### `php` — How workers are started
+### `php` — Worker process
 
-Tells the Go runtime which PHP binary and script to run for each worker process. The Go process spawns: `php` with the configured worker script and passes `--sock` plus the socket path.
-
-| Option | Type | Default | Context |
-|--------|------|---------|---------|
-| **`binary`** | string | `php` | Path to the PHP CLI binary. Use full path (e.g. `/usr/bin/php` or `/opt/php/8.2/bin/php`) if `php` is not in the process `PATH` when the runtime starts. |
-| **`worker_script`** | string | `worker.php` | Path to the worker entry script (relative to the process CWD or absolute). This script must instantiate `Worker` and call `run()`; it receives `--sock /path/to.sock` from the runtime. |
+| Option | Default | Context |
+|--------|---------|---------|
+| **`binary`** | `php` | PHP CLI binary path |
+| **`worker_script`** | `worker.php` | Entry script; receives `--sock` and `--max-requests` |
 
 ---
 
 ### `logging` — Runtime logs
 
-Controls the Go runtime’s own logs (startup, worker spawn/recycle, errors). Does not control PHP application logs.
-
-| Option | Type | Default | Context |
-|--------|------|---------|---------|
-| **`level`** | string | `info` | Minimum level to emit: `debug`, `info`, `warn`, `error`. Use `debug` for troubleshooting pool and protocol issues. |
-| **`format`** | string | `text` | Output format: `text` (human-readable lines) or `json` (one JSON object per line for log aggregators). |
-
----
-
-### Environment variables
-
-Configuration can be overridden with environment variables when supported by the binary (e.g. `NARYA_HOST`, `NARYA_PORT`, `NARYA_WORKERS`, `NARYA_LOG_LEVEL`). Check the binary’s `-help` or docs for the exact names.
+| Option | Default | Context |
+|--------|---------|---------|
+| **`level`** | `info` | `debug`, `info`, `warn`, `error` |
+| **`format`** | `text` | `text` or `json` |
 
 ---
 
@@ -248,27 +269,16 @@ Configuration can be overridden with environment variables when supported by the
 
 ### Example `worker.php` using the Worker orchestrator
 
-The Go runtime starts each PHP process with: `php worker.php --sock /path/to.sock`. Use the **Worker** class with a callable handler; it implements the UDS bridge internally and handles state reset and errors.
-
 ```php
 <?php
-
-/**
- * Example worker using the Worker class (orchestrator with reset, error handling).
- *
- * The Go runtime starts: php worker.php --sock /path/to.sock
- * Worker accepts a callable handler: same API, with state reset between requests.
- */
 
 declare(strict_types=1);
 
 require_once __DIR__ . '/vendor/autoload.php';
 
-use Narya\Runtime\Worker;
+use Narya\SDK\Runtime\Worker;
 
-// Pre-encoded responses (example; your app may use a router or framework)
-const HEALTH_JSON = '{"status":"ok","service":"api-go","version":"1.0.0"}';
-const ROOT_JSON   = '{"message":"Hello from Go API","data":[{"id":"1","name":"Gandalf","email":"gandalf@middleearth.com"},{"id":"2","name":"Frodo","email":"frodo@shire.com"},{"id":"3","name":"Aragorn","email":"aragorn@gondor.com"}],"total":3}';
+const HEALTH_JSON = '{"status":"ok"}';
 const HEADERS_JSON = ['Content-Type' => ['application/json']];
 
 $handler = function (array $request): array {
@@ -278,9 +288,7 @@ $handler = function (array $request): array {
     if ($path === '/health' && $method === 'GET') {
         return ['status' => 200, 'headers' => HEADERS_JSON, 'body' => HEALTH_JSON, 'error' => ''];
     }
-    if ($path === '/' && $method === 'GET') {
-        return ['status' => 200, 'headers' => HEADERS_JSON, 'body' => ROOT_JSON, 'error' => ''];
-    }
+
     return [
         'status'  => 404,
         'headers' => HEADERS_JSON,
@@ -297,6 +305,8 @@ try {
 }
 ```
 
+For Laravel, bootstrap the app inside a dedicated worker class and pass it to `Worker` — connect to UDS **before** heavy bootstrap when possible (see [PHP SDK alignment](#php-sdk-alignment-narya-php-sdk)).
+
 ---
 
 ## Communication Protocol
@@ -310,15 +320,23 @@ try {
 └────────────────┴─────────────────────────────┘
 ```
 
+Handshake: Go sends `NARYA1`, PHP responds `OK`.
+
 ### Request (Go → PHP)
 
-- `id`, `method`, `uri`, `path`, `query`, `headers`, `body`, `remote_addr`, `host`, `scheme`, `timeout_ms`
-- **`worker_id`** (int) — Set by the runtime on every request. Identifies which PHP worker process is handling the request. Use in the PHP SDK for logs, metrics, and distributed tracing.
-- **`runtime_version`** (string) — Set by the runtime on every request. Version of the Narya Go binary (e.g. `2.0.0`). Use in the PHP SDK for traceability and compatibility checks.
+- `id`, `method`, `uri`, `path`, `query`, `protocol`, `headers`, `body`, `server`, `remote_addr`, `host`, `scheme`, `timeout_ms`
+- **`worker_id`** (string) — PHP worker slot handling the request (traceability)
+- **`runtime_version`** (string) — Go runtime version (e.g. `2.0.0`)
 
 ### Response (PHP → Go)
 
-- `id`, `status`, `headers`, `body`, `error`, and optional `_meta` (e.g. `req_count`, `mem_usage`, `mem_peak`, `recycle`).
+- `id`, `status`, `headers`, `body`, `error`, optional `_meta` (`req_count`, `mem_usage`, `mem_peak`, `recycle`)
+
+### PHP SDK alignment (`narya-php-sdk`)
+
+1. **`max_requests`** — Runtime passes `--max-requests` from `workers.max_requests` in `nry.yaml`; SDK should align cooperative recycle via `_meta.recycle`.
+2. **Socket timeout** — Reset `stream_set_timeout` after each request (do not leave per-request `timeout_ms` permanently).
+3. **Early UDS connect** — Complete handshake before heavy framework bootstrap to avoid spawn timeouts and OOM when many workers start in parallel.
 
 ---
 
@@ -326,50 +344,52 @@ try {
 
 ### State reset
 
-Each worker **must** reset state between requests (e.g. clear DI container, `$_GET`/`$_POST`, request-scoped caches, open DB cursors). The **Worker** class orchestrates this: use `Worker` with your handler so that reset and error handling are applied between requests. You can also implement a custom reset step in your application layer if needed.
+Each worker **must** reset state between requests. The SDK **Worker** class orchestrates reset and error handling; application code should avoid mutable singletons and global state.
 
 ### Automatic recycling
 
 Workers are recycled after:
 
-- **N requests** (`max_requests`)
-- **Timeout** (`timeout`)
-- **Crash or fatal error**
-- **Memory growth** (when tracked via `_meta`)
-
-### Best practices
-
-1. Avoid mutable singletons; use request-scoped services.
-2. Do not rely on global variables across requests.
-3. Close resources (streams, handles) after each request.
-4. Implement a strict reset between requests.
+- **N requests** (`max_requests`, aligned Go ↔ PHP)
+- **Timeout** (`timeout`, UDS deadline)
+- **Crash or fatal error** (process reaper + idempotent respawn)
+- **Cooperative recycle** (`_meta.recycle` from PHP)
 
 ---
 
 ## Roadmap
 
-### Phase 1
+### Phase 1 — Core (done)
 
-- [x] Go server with worker pool
-- [x] UDS + MessagePack communication
-- [x] CLI to start runtime
-- [x] Worker recycling and scaling
-- [x] Health checks
+- [x] Go HTTP server with worker pool
+- [x] UDS + MessagePack protocol
+- [x] Worker spawn, recycle, and dynamic scaling (`min_workers` / `max_workers`)
+- [x] Backpressure and queue timeout overflow strategies
+- [x] Health check (`/narya/health`)
+- [x] Prometheus metrics (`/narya/metrics`)
+- [x] Debug workers endpoint (`/narya/debug/workers`)
+- [x] Graceful shutdown (SIGINT / SIGTERM)
+- [x] Runtime hot config (`/narya/config`, `narya config get/set`)
+- [x] Worker traceability (`worker_id`, `runtime_version` on every request)
+- [x] `--max-requests` passed to PHP on spawn
+- [x] UDS request deadlines and idempotent worker respawn
+- [x] Process reaper (`exitCh`) for early dead-worker detection
+- [x] Warmup stagger and `fast_warmup`
+- [x] `keep_warm` mode (disable scale-down)
 
-### Phase 2 – Stability
+### Phase 2 — Stability & polish
 
-- [ ] Full HTTP/2 support
-- [ ] Prometheus metrics (`/metrics`)
-- [ ] Graceful shutdown (SIGTERM)
-- [ ] Hot reload (SIGHUP)
-- [ ] Web dashboard
+- [ ] Full HTTP/2 support (`enable_http2` wired end-to-end)
+- [ ] Hot reload (SIGHUP) — reload config without full restart
+- [ ] Web dashboard for pool visualization
+- [ ] Configurable worker spawn/connect timeout in `nry.yaml`
 
-### Phase 3 – Advanced
+### Phase 3 — Advanced
 
 - [ ] WebSocket support
 - [ ] Server-Sent Events (SSE)
-- [ ] Multi-framework support
-- [ ] systemd/supervisor integration
+- [ ] First-class multi-framework adapters (Laravel, Symfony, Slim)
+- [ ] systemd / supervisor unit templates
 
 ---
 
@@ -377,25 +397,31 @@ Workers are recycled after:
 
 ```
 NaryaRuntimeEngine/
-├── main.go           # Entry point, HTTP server
-├── worker.go         # Pool manager, process lifecycle
-├── protocol.go       # MessagePack serialization
-├── config.go         # Configuration loading
-├── logger.go         # Logging
-├── go.mod
-├── Makefile          # Build scripts
-├── .rr.yaml.example  # Example configuration (copy to .rr.yaml)
+├── main.go              # HTTP server, routes, graceful shutdown
+├── worker.go            # Worker pool, spawn, respawn, scaling
+├── protocol.go          # MessagePack framing and request pools
+├── config.go            # nry.yaml schema and validation
+├── runtime_config.go    # Hot runtime config (min/max, backpressure)
+├── logger.go
+├── version.go
+├── Makefile
+├── nry.yaml.example     # Example config (copy to nry.yaml)
+├── tests/fixtures/      # PHP workers for integration tests
+├── worker_test.go
+├── worker_integration_test.go
+├── protocol_test.go
+├── config_test.go
 ├── README.md
 └── LICENSE
 ```
 
-PHP application code (e.g. `worker.php`, framework integration) lives in your project; this repository is the Go runtime and config schema.
+PHP application code (`worker.php`, framework integration) lives in your project; this repository is the Go runtime.
 
 ---
 
 ## License
 
-**MIT License** — open source and free to use, modify, and distribute. You may use it commercially; keep the copyright and license notice in the code. See [LICENSE](LICENSE) for the full text.
+**MIT License** — see [LICENSE](LICENSE).
 
 ---
 
@@ -403,9 +429,8 @@ PHP application code (e.g. `worker.php`, framework integration) lives in your pr
 
 1. Fork the repository.
 2. Create a feature branch (`git checkout -b feature/AmazingFeature`).
-3. Commit your changes (`git commit -m 'Add AmazingFeature'`).
-4. Push to the branch (`git push origin feature/AmazingFeature`).
-5. Open a Pull Request.
+3. Commit your changes.
+4. Push and open a Pull Request.
 
 ---
 

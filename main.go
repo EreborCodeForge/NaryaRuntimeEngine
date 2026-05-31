@@ -49,9 +49,7 @@ func (ln *tcpKeepAliveListener) Accept() (net.Conn, error) {
 	return tc, nil
 }
 
-const (
-	version = "2.0.0"
-	banner  = `
+const banner = `
  _   _    _    ______   __    _    
 | \ | |  / \  |  _ \ \ / /   / \   
 |  \| | / _ \ | |_) \ V /   / _ \  
@@ -61,7 +59,6 @@ const (
 Runtime Engine v%s
 The Runtime that Ignites and Scales Applications
 `
-)
 
 type Server struct {
 	config        *Config
@@ -175,7 +172,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.Workers.Timeout)
 	defer cancel()
 
-	resp, err := s.pool.Execute(ctx, req)
+	resp, err := s.pool.Execute(ctx, req, s.config.Workers.Timeout)
 	if err != nil {
 		errMsg := err.Error()
 

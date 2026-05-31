@@ -51,39 +51,74 @@ func AcquireRequest() *Request {
 
 // ReleaseRequest devolve um Request ao pool
 func ReleaseRequest(r *Request) {
-	// Limpa campos para reutilização
+	resetRequestForPool(r)
+	requestPool.Put(r)
+}
+
+const (
+	MaxPayloadSize          = 10 * 1024 * 1024
+	MaxReusableBodyCap      = 256 * 1024
+	MaxReusableMsgpackCap   = 256 * 1024
+	MaxReusableHeadersCount = 128
+	MaxReusableServerCount  = 128
+	MagicHandshake          = "NARYA1"
+	HandshakeOK             = "OK"
+)
+
+// resetRequestForPool clears a Request for pool reuse; drops oversized buffers/maps.
+func resetRequestForPool(r *Request) {
 	r.ID = 0
 	r.Method = ""
 	r.URI = ""
 	r.Path = ""
 	r.Query = ""
 	r.Protocol = ""
-	r.Body = r.Body[:0]
+	if cap(r.Body) > MaxReusableBodyCap {
+		r.Body = nil
+	} else {
+		r.Body = r.Body[:0]
+	}
 	r.RemoteAddr = ""
 	r.Host = ""
 	r.Scheme = ""
 	r.TimeoutMs = 0
 	r.WorkerID = ""
 	r.RuntimeVersion = ""
-	// Limpa maps sem realocar
-	for k := range r.Headers {
-		delete(r.Headers, k)
+
+	if len(r.Headers) > MaxReusableHeadersCount {
+		r.Headers = make(map[string][]string, 16)
+	} else {
+		for k := range r.Headers {
+			delete(r.Headers, k)
+		}
 	}
-	for k := range r.Server {
-		delete(r.Server, k)
+
+	if len(r.Server) > MaxReusableServerCount {
+		r.Server = make(map[string]string, 24)
+	} else {
+		for k := range r.Server {
+			delete(r.Server, k)
+		}
 	}
+
 	for k := range r.Meta {
 		delete(r.Meta, k)
 	}
-	requestPool.Put(r)
 }
 
-const (
-	MaxPayloadSize   = 10 * 1024 * 1024
-	MagicHandshake   = "NARYA1"
-	HandshakeOK      = "OK"
-	RuntimeVersion   = "1.0.0"
-)
+func writeFull(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
+}
 
 var requestIDCounter uint64
 
@@ -140,13 +175,13 @@ func (p *Protocol) WriteFrame(w io.Writer, payload []byte) error {
 	header := headerPool.Get().([]byte)
 	binary.BigEndian.PutUint32(header, uint32(len(payload)))
 
-	if _, err := w.Write(header); err != nil {
+	if err := writeFull(w, header); err != nil {
 		headerPool.Put(header)
 		return fmt.Errorf("failed to write header: %w", err)
 	}
 	headerPool.Put(header)
 
-	if _, err := w.Write(payload); err != nil {
+	if err := writeFull(w, payload); err != nil {
 		return fmt.Errorf("failed to write payload: %w", err)
 	}
 
@@ -194,13 +229,23 @@ func (p *Protocol) ReadFrame(r io.Reader) ([]byte, func(), error) {
 func (p *Protocol) SendRequest(w io.Writer, req *Request) error {
 	buf := msgpackBufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
-	defer msgpackBufferPool.Put(buf)
 
 	enc := msgpack.NewEncoder(buf)
 	if err := enc.Encode(req); err != nil {
+		if buf.Cap() <= MaxReusableMsgpackCap {
+			msgpackBufferPool.Put(buf)
+		}
 		return fmt.Errorf("failed to serialize request: %w", err)
 	}
-	return p.WriteFrame(w, buf.Bytes())
+
+	err := p.WriteFrame(w, buf.Bytes())
+
+	if buf.Cap() <= MaxReusableMsgpackCap {
+		buf.Reset()
+		msgpackBufferPool.Put(buf)
+	}
+
+	return err
 }
 
 func (p *Protocol) ReceiveResponse(r io.Reader) (*Response, error) {

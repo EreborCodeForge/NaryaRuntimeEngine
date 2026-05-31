@@ -1,46 +1,54 @@
 # Narya Runtime Engine Configuration
-# Copie este arquivo para .nry.yaml e ajuste conforme necessário
+# Copy this file to .nry.yaml and adjust as needed.
 
 server:
-  # Host do servidor (0.0.0.0 para aceitar conexões externas)
-  host: "0.0.0.0"
-  
-  # Porta do servidor HTTP
-  port: 8080
-  
-  # Timeout de leitura em segundos
+  host: 0.0.0.0
+  port: 8888
   read_timeout: 60
-  
-  # Timeout de escrita em segundos
   write_timeout: 60
-  
-  # Habilita HTTP/2 (Fase 2)
   enable_http2: true
+  # TCP listen backlog (default 4096)
+  backlog: 4096
 
 workers:
-  # Número de workers PHP
-  # Recomendado: número de CPUs ou mais para I/O bound
+  # Diagnostic profile for Laravel/WSL — lower min, stagger boot
   count: 4
-  
-  # Máximo de requests antes de reciclar worker
-  # Ajuda a prevenir memory leaks
-  # 0 = desabilitado (não recomendado)
-  max_requests: 1000
-  
-  # Timeout por request em segundos
-  # Requests que excedem são interrompidos
+  min_workers: 2
+  max_workers: 6
+  keep_warm: true
+
+  max_requests: 100
   timeout: 30
 
+  # Stagger worker spawn (ms) to avoid 16 Laravel boots at once
+  warmup_stagger_ms: 300
+  fast_warmup: true
+
+  scale_down_idle_secs: 30
+  aggressive_scale_down_secs: 10
+
+  # UDS socket directory (empty = /tmp/narya). In Docker use a project path.
+  # socket_dir: /var/www/bootstrap/cache/narya
+
+  backpressure:
+    enabled: true
+    max_queue: 100
+
+  queue_timeout:
+    enabled: true
+    timeout_ms: 1000
+
+  # Production-stable profile (after diagnostics):
+  # min_workers: 2
+  # max_workers: 8
+  # max_requests: 300
+  # backpressure.max_queue: 500
+  # queue_timeout.timeout_ms: 1500
+
 php:
-  # Caminho do binário PHP
-  binary: "php"
-  
-  # Script do worker (caminho absoluto ou relativo ao projeto)
-  worker_script: "worker.php"
+  binary: php
+  worker_script: worker.php
 
 logging:
-  # Nível de log: debug, info, warn, error
-  level: "info"
-  
-  # Formato: text, json
-  format: "text"
+  level: debug
+  format: text

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 )
 
@@ -243,4 +244,70 @@ func BenchmarkMsgPackVsJSON(b *testing.B) {
 			protocol.ReceiveRequest(&buf)
 		}
 	})
+}
+
+type partialWriter struct {
+	chunk int
+	buf   bytes.Buffer
+}
+
+func (p *partialWriter) Write(data []byte) (int, error) {
+	if p.chunk <= 0 {
+		p.chunk = 1
+	}
+	n := p.chunk
+	if n > len(data) {
+		n = len(data)
+	}
+	return p.buf.Write(data[:n])
+}
+
+func TestWriteFrameHandlesPartialWriter(t *testing.T) {
+	protocol := NewProtocol()
+	payload := []byte("hello partial write frame test data")
+
+	pw := &partialWriter{chunk: 2}
+	if err := protocol.WriteFrame(pw, payload); err != nil {
+		t.Fatalf("WriteFrame failed: %v", err)
+	}
+
+	result, release, err := protocol.ReadFrame(&pw.buf)
+	if err != nil {
+		t.Fatalf("ReadFrame failed: %v", err)
+	}
+	defer release()
+
+	if !bytes.Equal(result, payload) {
+		t.Errorf("payload mismatch: got %q want %q", result, payload)
+	}
+}
+
+func TestReleaseRequestDropsLargeBodyBuffer(t *testing.T) {
+	req := &Request{
+		Headers: make(map[string][]string, 16),
+		Server:  make(map[string]string, 24),
+		Meta:    make(map[string]string, 4),
+		Body:    make([]byte, MaxReusableBodyCap+1),
+	}
+
+	resetRequestForPool(req)
+	if req.Body != nil {
+		t.Fatal("expected large body to be dropped (nil)")
+	}
+
+	req.Body = []byte("small")
+	for i := 0; i < MaxReusableHeadersCount+1; i++ {
+		req.Headers[fmt.Sprintf("h%d", i)] = []string{"v"}
+	}
+	resetRequestForPool(req)
+	if len(req.Headers) != 0 {
+		t.Fatalf("expected headers map recreated empty, got len=%d", len(req.Headers))
+	}
+
+	req.Headers = make(map[string][]string, 4)
+	req.Headers["X-Test"] = []string{"ok"}
+	resetRequestForPool(req)
+	if len(req.Headers) != 0 {
+		t.Fatal("expected small headers map cleared in place")
+	}
 }
