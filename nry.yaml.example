@@ -20,6 +20,14 @@ workers:
   max_requests: 100
   timeout: 30
 
+  # Laravel/WSL: allow slow PHP bootstrap before UDS connect
+  spawn_timeout_secs: 120
+  handshake_timeout_secs: 15
+  max_parallel_spawns: 4
+  ensure_min_debounce_ms: 500
+  respawn_backoff_ms: 400
+  respawn_timeout_secs: 120
+
   # Stagger worker spawn (ms) to avoid 16 Laravel boots at once
   warmup_stagger_ms: 300
   fast_warmup: true

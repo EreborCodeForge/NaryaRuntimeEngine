@@ -6,8 +6,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -302,4 +304,14 @@ func (p *Protocol) Handshake(rw io.ReadWriter) error {
 	}
 
 	return nil
+}
+
+func (p *Protocol) HandshakeWithTimeout(rw io.ReadWriter, timeout time.Duration) error {
+	if conn, ok := rw.(net.Conn); ok && timeout > 0 {
+		if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+			return fmt.Errorf("failed to set handshake deadline: %w", err)
+		}
+		defer conn.SetDeadline(time.Time{})
+	}
+	return p.Handshake(rw)
 }

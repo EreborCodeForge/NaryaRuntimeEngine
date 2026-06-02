@@ -52,6 +52,19 @@ type WorkersConfig struct {
 	// Se true, após os min_workers sobe o restante até max_workers em background (pool cheio mais cedo)
 	FastWarmup bool `yaml:"fast_warmup"`
 
+	// Tempo máximo (s) para PHP conectar ao UDS após spawn (bootstrap Laravel pode demorar)
+	SpawnTimeoutSecs int `yaml:"spawn_timeout_secs"`
+	// Tempo máximo (s) para completar handshake NARYA1/OK após accept
+	HandshakeTimeoutSecs int `yaml:"handshake_timeout_secs"`
+	// Máximo de spawns simultâneos (evita rajada de boots PHP)
+	MaxParallelSpawns int `yaml:"max_parallel_spawns"`
+	// Debounce (ms) entre chamadas a ensureMinWorkers
+	EnsureMinDebounceMs int `yaml:"ensure_min_debounce_ms"`
+	// Backoff mínimo (ms) entre respawns do mesmo worker ID
+	RespawnBackoffMs int `yaml:"respawn_backoff_ms"`
+	// Max time a worker may stay in respawning before eviction and replacement
+	RespawnTimeoutSecs int `yaml:"respawn_timeout_secs"`
+
 	// Estratégias de overflow (mutuamente exclusivas)
 	// backpressure: rejeita imediatamente com 503 se fila cheia
 	// queue_timeout: espera até X segundos na fila, depois 503
@@ -99,12 +112,18 @@ func DefaultConfig() *Config {
 			Backlog:          4096,
 		},
 		Workers: WorkersConfig{
-			Count:       4,
-			MinWorkers:  4,
-			MaxWorkers:  4,
-			MaxRequests: 1000,
-			Timeout:     30 * time.Second,
-			TimeoutSecs: 30,
+			Count:                4,
+			MinWorkers:           4,
+			MaxWorkers:           4,
+			MaxRequests:          1000,
+			Timeout:              30 * time.Second,
+			TimeoutSecs:          30,
+			SpawnTimeoutSecs:     120,
+			HandshakeTimeoutSecs: 15,
+			MaxParallelSpawns:    4,
+			EnsureMinDebounceMs:  500,
+			RespawnBackoffMs:     400,
+			RespawnTimeoutSecs:   120,
 		},
 		PHP: PHPConfig{
 			Binary:       "php",
@@ -142,6 +161,25 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.Workers.TimeoutSecs > 0 {
 		cfg.Workers.Timeout = time.Duration(cfg.Workers.TimeoutSecs) * time.Second
+	}
+
+	if cfg.Workers.SpawnTimeoutSecs <= 0 {
+		cfg.Workers.SpawnTimeoutSecs = 120
+	}
+	if cfg.Workers.HandshakeTimeoutSecs <= 0 {
+		cfg.Workers.HandshakeTimeoutSecs = 15
+	}
+	if cfg.Workers.MaxParallelSpawns <= 0 {
+		cfg.Workers.MaxParallelSpawns = 4
+	}
+	if cfg.Workers.EnsureMinDebounceMs <= 0 {
+		cfg.Workers.EnsureMinDebounceMs = 500
+	}
+	if cfg.Workers.RespawnBackoffMs <= 0 {
+		cfg.Workers.RespawnBackoffMs = 400
+	}
+	if cfg.Workers.RespawnTimeoutSecs <= 0 {
+		cfg.Workers.RespawnTimeoutSecs = 120
 	}
 
 	// Normaliza min/max: 0 = usar count (comportamento fixo)

@@ -38,9 +38,11 @@ type Worker struct {
 	requestCount   int64
 	startTime      time.Time
 	lastActiveTime time.Time
+	respawnStartedAt time.Time
 	protocol       *Protocol
 	exitCh         chan error
 	waitOnce       sync.Once
+	pool           *WorkerPool
 	mu             sync.Mutex
 }
 
@@ -84,6 +86,29 @@ type WorkerPool struct {
 	lastScaleUp             time.Time
 	lastScaleUpMu           sync.Mutex
 
+	spawnTimeout            time.Duration
+	handshakeTimeout        time.Duration
+	spawnInFlight           int32
+	spawnSemaphore          chan struct{}
+	ensureMinDebounce       time.Duration
+	ensureMinLast           time.Time
+	ensureMinLastMu         sync.Mutex
+	respawnBackoff          time.Duration
+	lastRespawnAt           map[int]time.Time
+	lastRespawnMu           sync.Mutex
+	slotLockMu              sync.Mutex
+	slotLocks               map[int]*sync.Mutex
+	spawnTimeoutsTotal      int64
+	spawnHandshakeFails     int64
+	spawnBindErrorsTotal    int64
+	stuckRespawningTotal      int64
+	availableQueueDroppedTotal int64
+	respawnTimeout            time.Duration
+	respawnSemaphore          chan struct{}
+	consecutiveSpawnFailures  int32
+	spawnCircuitOpenUntil     time.Time
+	spawnCircuitMu            sync.Mutex
+
 	// spawnWorkerHook is set in tests to intercept spawn/respawn.
 	spawnWorkerHook func(id int) (*Worker, error)
 }
@@ -108,6 +133,12 @@ type WorkerPoolConfig struct {
 	QueueTimeoutMs          int
 	KeepWarm                bool
 	Runtime                 *RuntimeConfig
+	SpawnTimeout            time.Duration
+	HandshakeTimeout        time.Duration
+	MaxParallelSpawns       int
+	EnsureMinDebounce       time.Duration
+	RespawnBackoff          time.Duration
+	RespawnTimeout          time.Duration
 }
 
 func NewWorkerPool(cfg WorkerPoolConfig) *WorkerPool {
@@ -131,6 +162,32 @@ func NewWorkerPool(cfg WorkerPoolConfig) *WorkerPool {
 	if runtime == nil {
 		runtime = NewRuntimeConfig(minWorkers, maxWorkers, cfg.BackpressureEnabled, cfg.BackpressureMaxQueue, cfg.KeepWarm)
 	}
+
+	spawnTimeout := cfg.SpawnTimeout
+	if spawnTimeout <= 0 {
+		spawnTimeout = 120 * time.Second
+	}
+	handshakeTimeout := cfg.HandshakeTimeout
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = 15 * time.Second
+	}
+	maxParallelSpawns := cfg.MaxParallelSpawns
+	if maxParallelSpawns <= 0 {
+		maxParallelSpawns = 4
+	}
+	ensureMinDebounce := cfg.EnsureMinDebounce
+	if ensureMinDebounce <= 0 {
+		ensureMinDebounce = 500 * time.Millisecond
+	}
+	respawnBackoff := cfg.RespawnBackoff
+	if respawnBackoff <= 0 {
+		respawnBackoff = 400 * time.Millisecond
+	}
+	respawnTimeout := cfg.RespawnTimeout
+	if respawnTimeout <= 0 {
+		respawnTimeout = defaultRespawnTimeout
+	}
+
 	return &WorkerPool{
 		workers:                 make([]*Worker, 0, maxWorkers),
 		available:               make(chan *Worker, maxWorkers),
@@ -156,6 +213,13 @@ func NewWorkerPool(cfg WorkerPoolConfig) *WorkerPool {
 		backpressureMaxQueue:    cfg.BackpressureMaxQueue,
 		queueTimeoutEnabled:     cfg.QueueTimeoutEnabled,
 		queueTimeoutMs:          cfg.QueueTimeoutMs,
+		spawnTimeout:            spawnTimeout,
+		handshakeTimeout:        handshakeTimeout,
+		spawnSemaphore:          make(chan struct{}, maxParallelSpawns),
+		ensureMinDebounce:       ensureMinDebounce,
+		respawnBackoff:          respawnBackoff,
+		respawnTimeout:          respawnTimeout,
+		respawnSemaphore:        make(chan struct{}, maxWorkers),
 	}
 }
 
@@ -168,6 +232,98 @@ func (p *WorkerPool) buildWorkerCommand(sockPath string) *exec.Cmd {
 		args = append(args, "--max-requests", strconv.Itoa(p.maxRequests))
 	}
 	return exec.Command(p.phpBinary, args...)
+}
+
+func (p *WorkerPool) lockWorkerSlot(id int) func() {
+	p.slotLockMu.Lock()
+	if p.slotLocks == nil {
+		p.slotLocks = make(map[int]*sync.Mutex)
+	}
+	mu, ok := p.slotLocks[id]
+	if !ok {
+		mu = &sync.Mutex{}
+		p.slotLocks[id] = mu
+	}
+	p.slotLockMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
+func (p *WorkerPool) acquireSpawnSlot() {
+	select {
+	case p.spawnSemaphore <- struct{}{}:
+	case <-p.ctx.Done():
+	}
+}
+
+func (p *WorkerPool) releaseSpawnSlot() {
+	select {
+	case <-p.spawnSemaphore:
+	default:
+	}
+}
+
+func (p *WorkerPool) canRespawnNow(id int) bool {
+	p.lastRespawnMu.Lock()
+	defer p.lastRespawnMu.Unlock()
+	if p.lastRespawnAt == nil {
+		return true
+	}
+	if last, ok := p.lastRespawnAt[id]; ok && time.Since(last) < p.respawnBackoff {
+		return false
+	}
+	return true
+}
+
+func (p *WorkerPool) noteRespawnAttempt(id int) {
+	p.lastRespawnMu.Lock()
+	if p.lastRespawnAt == nil {
+		p.lastRespawnAt = make(map[int]time.Time)
+	}
+	p.lastRespawnAt[id] = time.Now()
+	p.lastRespawnMu.Unlock()
+}
+
+func (p *WorkerPool) countReadyWorkers() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	n := 0
+	for _, w := range p.workers {
+		w.mu.Lock()
+		st := w.state
+		w.mu.Unlock()
+		if st == WorkerStateIdle || st == WorkerStateBusy {
+			n++
+		}
+	}
+	return n
+}
+
+func (p *WorkerPool) waitForMinWorkersReady(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	min := p.runtime.GetMinWorkers()
+	for time.Now().Before(deadline) {
+		if p.countReadyWorkers() >= min {
+			return true
+		}
+		select {
+		case <-p.ctx.Done():
+			return false
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	return p.countReadyWorkers() >= min
+}
+
+func (p *WorkerPool) effectiveWarmupStagger(minWorkers int) int {
+	staggerMs := p.warmupStaggerMs
+	if staggerMs <= 0 && minWorkers > 4 {
+		staggerMs = 100
+		if p.logger != nil {
+			p.logger.Warn("min_workers=%d without warmup_stagger_ms; using default 100ms stagger", minWorkers)
+		}
+	}
+	return staggerMs
 }
 
 func (w *Worker) startReaper(logger *Logger) {
@@ -198,8 +354,28 @@ func (w *Worker) startReaper(logger *Logger) {
 			if err != nil && logger != nil {
 				logger.Warn("Worker %d process exited: %v", w.ID, err)
 			}
+
+			if w.pool != nil {
+				w.pool.onWorkerProcessExit(w)
+			}
 		}()
 	})
+}
+
+func (p *WorkerPool) onWorkerProcessExit(w *Worker) {
+	w.mu.Lock()
+	st := w.state
+	w.mu.Unlock()
+
+	if st == WorkerStateRespawning {
+		return
+	}
+
+	p.evictDeadWorker(w, "process_exit")
+	p.compactAvailableQueue()
+	if !p.spawnCircuitOpen() {
+		p.ensureMinWorkers()
+	}
 }
 
 func (p *WorkerPool) terminateWorker(w *Worker, reason string) {
@@ -240,6 +416,7 @@ func (p *WorkerPool) markRespawning(w *Worker) bool {
 	}
 
 	w.state = WorkerStateRespawning
+	w.respawnStartedAt = time.Now()
 	return true
 }
 
@@ -250,31 +427,40 @@ func (p *WorkerPool) markDead(w *Worker) {
 }
 
 func (p *WorkerPool) scheduleRespawn(w *Worker, reason string) {
+	if !p.canRespawnNow(w.ID) {
+		if p.logger != nil {
+			p.logger.Debug("Worker %d respawn backoff active; reason=%s", w.ID, reason)
+		}
+		return
+	}
 	if !p.markRespawning(w) {
 		if p.logger != nil {
 			p.logger.Debug("Worker %d already respawning; reason=%s", w.ID, reason)
 		}
 		return
 	}
+	p.noteRespawnAttempt(w.ID)
 
 	go func() {
+		p.acquireRespawnSlot()
+		defer p.releaseRespawnSlot()
+
 		newWorker, err := p.respawnWorker(w)
 		if err != nil {
 			if p.logger != nil {
 				p.logger.Error("Failed to respawn worker %d: %v", w.ID, err)
 			}
-			p.markDead(w)
+			p.noteSpawnFailure()
+			p.evictDeadWorker(w, "respawn_failed")
+			p.syncActiveWorkersCount()
 			p.ensureMinWorkers()
 			return
 		}
 
-		select {
-		case p.available <- newWorker:
-			if p.logger != nil {
-				p.logger.Info("Worker %d respawned successfully; reason=%s", newWorker.ID, reason)
-			}
-		case <-p.ctx.Done():
-			p.destroyWorker(newWorker)
+		p.noteSpawnSuccess()
+
+		if p.releaseWorkerToAvailable(newWorker) && p.logger != nil {
+			p.logger.Info("Worker %d respawned successfully; reason=%s", newWorker.ID, reason)
 		}
 	}()
 }
@@ -295,6 +481,16 @@ func (p *WorkerPool) doSpawnWorker(id int) (*Worker, error) {
 	if p.spawnWorkerHook != nil {
 		return p.spawnWorkerHook(id)
 	}
+
+	unlock := p.lockWorkerSlot(id)
+	defer unlock()
+
+	atomic.AddInt32(&p.spawnInFlight, 1)
+	defer atomic.AddInt32(&p.spawnInFlight, -1)
+
+	p.acquireSpawnSlot()
+	defer p.releaseSpawnSlot()
+
 	return p.spawnWorker(id)
 }
 
@@ -320,10 +516,10 @@ func (p *WorkerPool) Start() error {
 	p.mu.Unlock()
 
 	minW, maxW := p.runtime.GetMinWorkers(), p.runtime.GetMaxWorkers()
-	p.logger.Info("Starting pool (min=%d max=%d, UDS: %s)", minW, maxW, p.sockDir)
-	staggerMs := p.warmupStaggerMs
+	p.logger.Info("Starting pool (min=%d max=%d, UDS: %s, spawn_timeout=%s)", minW, maxW, p.sockDir, p.spawnTimeout)
+	staggerMs := p.effectiveWarmupStagger(minW)
 	if staggerMs > 0 {
-		p.logger.Info("Spawning %d min workers with %dms stagger (faster ready under load)", minW, staggerMs)
+		p.logger.Info("Spawning %d min workers with %dms stagger", minW, staggerMs)
 	} else {
 		p.logger.Info("Spawning %d min workers in parallel; scale-up to max on load (≈70%% utilization)", minW)
 	}
@@ -336,7 +532,13 @@ func (p *WorkerPool) Start() error {
 	}
 
 	if p.fastWarmup && minW < maxW {
-		go p.warmUpToMax()
+		go func() {
+			if p.waitForMinWorkersReady(p.spawnTimeout) {
+				p.warmUpToMax()
+			} else if p.logger != nil {
+				p.logger.Warn("fast_warmup: min workers not ready within spawn_timeout; deferring scale-up")
+			}
+		}()
 	}
 
 	go p.scalerLoop()
@@ -356,7 +558,7 @@ func (p *WorkerPool) Start() error {
 }
 
 func (p *WorkerPool) warmUpToMax() {
-	staggerMs := p.warmupStaggerMs
+	staggerMs := p.effectiveWarmupStagger(p.runtime.GetMinWorkers())
 	if staggerMs <= 0 {
 		staggerMs = 100
 	}
@@ -367,24 +569,33 @@ func (p *WorkerPool) warmUpToMax() {
 	}
 }
 
+func (p *WorkerPool) abortSpawn(worker *Worker, listener net.Listener, cmd *exec.Cmd, sockPath string) {
+	if worker != nil && worker.conn != nil {
+		_ = worker.conn.Close()
+		worker.conn = nil
+	}
+	if listener != nil {
+		_ = listener.Close()
+	}
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	_ = os.Remove(sockPath)
+	if worker != nil {
+		worker.listener = nil
+	}
+}
+
 func (p *WorkerPool) spawnWorker(id int) (*Worker, error) {
 	sockPath := filepath.Join(p.sockDir, fmt.Sprintf("worker-%03d.sock", id))
 
 	if err := os.MkdirAll(p.sockDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create socket directory: %w", err)
 	}
-	if err := os.Remove(sockPath); err != nil && !os.IsNotExist(err) {
-		p.logger.Warn("Error removing old socket %s: %v", sockPath, err)
-	}
 
-	listener, err := net.Listen("unix", sockPath)
+	listener, err := p.listenUnix(sockPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create UDS listener: %w", err)
-	}
-
-	if err := os.Chmod(sockPath, 0600); err != nil {
-		listener.Close()
-		return nil, fmt.Errorf("failed to set socket permissions: %w", err)
 	}
 
 	for i := 0; i < 50; i++ {
@@ -401,8 +612,7 @@ func (p *WorkerPool) spawnWorker(id int) (*Worker, error) {
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
-		listener.Close()
-		os.Remove(sockPath)
+		p.abortSpawn(nil, listener, nil, sockPath)
 		return nil, fmt.Errorf("failed to start PHP process: %w", err)
 	}
 
@@ -422,6 +632,7 @@ func (p *WorkerPool) spawnWorker(id int) (*Worker, error) {
 		lastActiveTime: time.Now(),
 		protocol:       p.protocol,
 		exitCh:         make(chan error, 1),
+		pool:           p,
 	}
 	worker.startReaper(p.logger)
 
@@ -437,28 +648,31 @@ func (p *WorkerPool) spawnWorker(id int) (*Worker, error) {
 		connChan <- conn
 	}()
 
+	spawnTimer := time.NewTimer(p.spawnTimeout)
+	defer spawnTimer.Stop()
+
 	select {
 	case conn := <-connChan:
+		_ = listener.Close()
+		worker.listener = nil
 		worker.conn = conn
-		if err := p.protocol.Handshake(conn); err != nil {
-			conn.Close()
-			cmd.Process.Kill()
-			listener.Close()
-			os.Remove(sockPath)
+		if err := p.protocol.HandshakeWithTimeout(conn, p.handshakeTimeout); err != nil {
+			atomic.AddInt64(&p.spawnHandshakeFails, 1)
+			p.abortSpawn(worker, nil, cmd, sockPath)
 			return nil, fmt.Errorf("handshake failed: %w", err)
 		}
 		worker.state = WorkerStateIdle
 		p.logger.Debug("Worker %d started (PID: %d, socket: %s)", id, cmd.Process.Pid, sockPath)
 	case err := <-errChan:
-		cmd.Process.Kill()
-		listener.Close()
-		os.Remove(sockPath)
+		p.abortSpawn(worker, listener, cmd, sockPath)
 		return nil, fmt.Errorf("failed to accept connection: %w", err)
-	case <-time.After(60 * time.Second):
-		cmd.Process.Kill()
-		listener.Close()
-		os.Remove(sockPath)
-		return nil, fmt.Errorf("timeout waiting for worker connection")
+	case <-spawnTimer.C:
+		atomic.AddInt64(&p.spawnTimeoutsTotal, 1)
+		p.abortSpawn(worker, listener, cmd, sockPath)
+		return nil, fmt.Errorf("timeout waiting for worker connection after %s", p.spawnTimeout)
+	case <-p.ctx.Done():
+		p.abortSpawn(worker, listener, cmd, sockPath)
+		return nil, p.ctx.Err()
 	}
 
 	return worker, nil
@@ -468,6 +682,9 @@ func (p *WorkerPool) GetWorker(ctx context.Context) (*Worker, error) {
 	if worker := p.tryGetWorker(); worker != nil {
 		return worker, nil
 	}
+
+	p.compactAvailableQueue()
+	p.pruneDeadWorkers()
 
 	backpressureEnabled := p.runtime.GetBackpressureEnabled()
 	backpressureMaxQueue := p.runtime.GetBackpressureMaxQueue()
@@ -488,10 +705,8 @@ func (p *WorkerPool) GetWorker(ctx context.Context) (*Worker, error) {
 		defer atomic.AddInt32(&p.queuedRequests, -1)
 	}
 
-	p.mu.RLock()
-	n := len(p.workers)
-	p.mu.RUnlock()
-	if n < p.runtime.GetMaxWorkers() {
+	maxW := p.runtime.GetMaxWorkers()
+	if !p.spawnCircuitOpen() && p.livingWorkerCount() < maxW && p.countAvailableQueued() < maxW {
 		go p.addWorker()
 	}
 
@@ -537,6 +752,17 @@ func (p *WorkerPool) tryGetWorker() *Worker {
 	default:
 		return nil
 	}
+}
+
+func (p *WorkerPool) shouldHealthRespawn(w *Worker) bool {
+	w.mu.Lock()
+	state := w.state
+	w.mu.Unlock()
+
+	if state == WorkerStateBusy || state == WorkerStateRespawning || state == WorkerStateStarting {
+		return false
+	}
+	return p.isWorkerDead(w)
 }
 
 func (p *WorkerPool) isWorkerDead(w *Worker) bool {
@@ -625,10 +851,12 @@ func (p *WorkerPool) ReleaseWorker(worker *Worker, resp *Response) {
 
 	atomic.AddInt64(&p.totalRequests, 1)
 
-	select {
-	case p.available <- worker:
-	case <-p.ctx.Done():
-		p.destroyWorker(worker)
+	if !p.releaseWorkerToAvailable(worker) {
+		select {
+		case <-p.ctx.Done():
+			p.destroyWorker(worker)
+		default:
+		}
 	}
 }
 
@@ -639,7 +867,7 @@ func (p *WorkerPool) respawnWorker(old *Worker) (*Worker, error) {
 
 	newWorker, err := p.doSpawnWorker(old.ID)
 	if err != nil {
-		p.removeWorkerFromSlice(old.ID)
+		p.removeWorkerFromSliceIfPresent(old.ID)
 		return nil, err
 	}
 
@@ -662,9 +890,20 @@ func (p *WorkerPool) respawnWorker(old *Worker) (*Worker, error) {
 }
 
 func (p *WorkerPool) addWorker() {
+	if p.spawnCircuitOpen() {
+		return
+	}
+	if p.livingWorkerCount() >= p.runtime.GetMaxWorkers() {
+		return
+	}
+
 	for {
 		cur := atomic.LoadInt32(&p.activeWorkers)
 		if cur >= int32(p.runtime.GetMaxWorkers()) {
+			if p.countOccupyingSlots() < p.runtime.GetMaxWorkers() {
+				p.syncActiveWorkersCount()
+				continue
+			}
 			return
 		}
 		if atomic.CompareAndSwapInt32(&p.activeWorkers, cur, cur+1) {
@@ -678,24 +917,23 @@ func (p *WorkerPool) addWorker() {
 		worker, err := p.doSpawnWorker(id)
 		if err != nil {
 			atomic.AddInt32(&p.activeWorkers, -1)
+			p.noteSpawnFailure()
 			p.logger.Error("Scale-up: failed to create worker %d: %v", id, err)
+			p.pruneDeadWorkers()
 			p.ensureMinWorkers()
 			return
 		}
+		p.noteSpawnSuccess()
 		p.mu.Lock()
+		p.pruneDeadWorkersLocked()
 		p.workers = append(p.workers, worker)
-		currentTotal := len(p.workers)
+		currentTotal := p.countLivingWorkersLocked()
 		p.mu.Unlock()
 
-		select {
-		case p.available <- worker:
+		if p.releaseWorkerToAvailable(worker) {
 			currentActive := atomic.LoadInt32(&p.activeWorkers)
 			p.logger.Info("Scale-up: worker %d (PID %d) added; active=%d, total_slots=%d", worker.ID, worker.Pid, currentActive, currentTotal)
-		case <-p.ctx.Done():
-			p.destroyWorker(worker)
-			atomic.AddInt32(&p.activeWorkers, -1)
-		default:
-			p.destroyWorker(worker)
+		} else {
 			atomic.AddInt32(&p.activeWorkers, -1)
 		}
 	}()
@@ -703,20 +941,14 @@ func (p *WorkerPool) addWorker() {
 
 func (p *WorkerPool) removeWorker(w *Worker) {
 	if time.Since(p.bootTime) < 30*time.Second {
-		select {
-		case p.available <- w:
-		default:
-		}
+		p.releaseWorkerToAvailable(w)
 		return
 	}
 
 	p.mu.Lock()
-	if len(p.workers) <= p.runtime.GetMinWorkers() {
+	if p.countLivingWorkersLocked() <= p.runtime.GetMinWorkers() {
 		p.mu.Unlock()
-		select {
-		case p.available <- w:
-		default:
-		}
+		p.releaseWorkerToAvailable(w)
 		return
 	}
 	for i, worker := range p.workers {
@@ -725,7 +957,7 @@ func (p *WorkerPool) removeWorker(w *Worker) {
 			break
 		}
 	}
-	currentTotal := len(p.workers)
+	currentTotal := p.countLivingWorkersLocked()
 	p.mu.Unlock()
 
 	minW := p.runtime.GetMinWorkers()
@@ -746,15 +978,42 @@ const scaleUpUtilizationThreshold = 0.70
 const scaleUpCooldownMs = 400
 
 func (p *WorkerPool) ensureMinWorkers() {
+	if p.spawnCircuitOpen() {
+		return
+	}
+
+	p.pruneDeadWorkers()
+
+	now := time.Now()
+	p.ensureMinLastMu.Lock()
+	if !p.ensureMinLast.IsZero() && now.Sub(p.ensureMinLast) < p.ensureMinDebounce {
+		p.ensureMinLastMu.Unlock()
+		return
+	}
+	p.ensureMinLast = now
+	p.ensureMinLastMu.Unlock()
+
 	min := p.runtime.GetMinWorkers()
+	max := p.runtime.GetMaxWorkers()
+	ready := p.countReadyWorkers()
+	inFlight := int(atomic.LoadInt32(&p.spawnInFlight))
+	living := p.livingWorkerCount()
+	need := min - ready - inFlight
+	if need <= 0 {
+		return
+	}
+	if living+inFlight >= max {
+		return
+	}
+	if need > max-living-inFlight {
+		need = max - living - inFlight
+	}
+	if need <= 0 {
+		return
+	}
 
-	p.mu.RLock()
-	current := len(p.workers)
-	p.mu.RUnlock()
-
-	for current < min {
+	for i := 0; i < need; i++ {
 		go p.addWorker()
-		current++
 	}
 }
 
@@ -767,9 +1026,7 @@ func (p *WorkerPool) scalerLoop() {
 		case <-p.ctx.Done():
 			return
 		case <-ticker.C:
-			p.mu.RLock()
-			total := len(p.workers)
-			p.mu.RUnlock()
+			total := p.livingWorkerCount()
 			min := p.runtime.GetMinWorkers()
 			max := p.runtime.GetMaxWorkers()
 
@@ -836,9 +1093,7 @@ func (p *WorkerPool) scalerLoop() {
 			if p.aggressiveScaleDownSecs > 0 && idleSince >= time.Duration(p.aggressiveScaleDownSecs)*time.Second {
 			aggressive:
 				for {
-					p.mu.RLock()
-					current := len(p.workers)
-					p.mu.RUnlock()
+					current := p.livingWorkerCount()
 					if current <= min {
 						break aggressive
 					}
@@ -962,6 +1217,13 @@ func (p *WorkerPool) healthMonitor() {
 }
 
 func (p *WorkerPool) checkAndRespawnDeadWorkers() {
+	p.compactAvailableQueue()
+	pruned := p.pruneDeadWorkers()
+	p.reconcileStuckWorkers()
+	if pruned > 0 {
+		p.syncActiveWorkersCount()
+	}
+
 	p.mu.RLock()
 	workers := make([]*Worker, len(p.workers))
 	copy(workers, p.workers)
@@ -969,10 +1231,19 @@ func (p *WorkerPool) checkAndRespawnDeadWorkers() {
 
 	var deadCount int
 	for i, worker := range workers {
-		if p.isWorkerDead(worker) {
+		worker.mu.Lock()
+		state := worker.state
+		worker.mu.Unlock()
+
+		if state == WorkerStateDead {
+			p.forceEvictWorker(worker, "health_dead")
+			continue
+		}
+
+		if p.shouldHealthRespawn(worker) {
 			deadCount++
 			if i > 0 {
-				time.Sleep(400 * time.Millisecond)
+				time.Sleep(p.respawnBackoff)
 			}
 			p.scheduleRespawn(worker, "health_monitor")
 		}
@@ -1034,26 +1305,46 @@ func (p *WorkerPool) Stats() PoolStats {
 	p.mu.RUnlock()
 
 	detail := make([]WorkerInfo, 0, len(workers))
+	deadCount := 0
 	for _, w := range workers {
 		w.mu.Lock()
-		detail = append(detail, WorkerInfo{
+		st := w.state
+		info := WorkerInfo{
 			Id:           w.ID,
 			Pid:          w.Pid,
-			State:        workerStateString(w.state),
+			State:        workerStateString(st),
 			RequestCount: w.requestCount,
 			StartTime:    w.startTime,
 			UptimeSecs:   time.Since(w.startTime).Seconds(),
-		})
+		}
 		w.mu.Unlock()
+		if st == WorkerStateDead {
+			deadCount++
+			continue
+		}
+		detail = append(detail, info)
 	}
 
+	living := len(workers) - deadCount
+	spawnCircuitOpen := p.spawnCircuitOpen()
+
 	return PoolStats{
-		TotalRequests:    atomic.LoadInt64(&p.totalRequests),
-		ActiveWorkers:    int32(len(workers)),
-		AvailableWorkers: int32(len(p.available)),
-		WorkersDetail:    detail,
-		MinWorkers:       p.runtime.GetMinWorkers(),
-		MaxWorkers:       p.runtime.GetMaxWorkers(),
+		TotalRequests:              atomic.LoadInt64(&p.totalRequests),
+		ActiveWorkers:              int32(living),
+		DeadWorkers:                int32(deadCount),
+		AvailableWorkers:           int32(len(p.available)),
+		WorkersDetail:              detail,
+		MinWorkers:                 p.runtime.GetMinWorkers(),
+		MaxWorkers:                 p.runtime.GetMaxWorkers(),
+		SpawnInFlight:              atomic.LoadInt32(&p.spawnInFlight),
+		SpawnTimeoutsTotal:         atomic.LoadInt64(&p.spawnTimeoutsTotal),
+		SpawnHandshakeFailures:     atomic.LoadInt64(&p.spawnHandshakeFails),
+		SpawnBindErrorsTotal:       atomic.LoadInt64(&p.spawnBindErrorsTotal),
+		StuckRespawningTotal:       atomic.LoadInt64(&p.stuckRespawningTotal),
+		AvailableQueueDroppedTotal: atomic.LoadInt64(&p.availableQueueDroppedTotal),
+		ReadyWorkers:               int32(p.countReadyWorkers()),
+		SpawnCircuitOpen:           spawnCircuitOpen,
+		ConsecutiveSpawnFailures:   atomic.LoadInt32(&p.consecutiveSpawnFailures),
 	}
 }
 
@@ -1067,10 +1358,20 @@ type WorkerInfo struct {
 }
 
 type PoolStats struct {
-	TotalRequests    int64        `json:"total_requests"`
-	ActiveWorkers    int32        `json:"active_workers"`
-	AvailableWorkers int32        `json:"available_workers"`
-	MinWorkers       int          `json:"min_workers"`
-	MaxWorkers       int          `json:"max_workers"`
-	WorkersDetail    []WorkerInfo `json:"workers,omitempty"`
+	TotalRequests              int64        `json:"total_requests"`
+	ActiveWorkers              int32        `json:"active_workers"`
+	DeadWorkers                int32        `json:"dead_workers"`
+	AvailableWorkers           int32        `json:"available_workers"`
+	MinWorkers                 int          `json:"min_workers"`
+	MaxWorkers                 int          `json:"max_workers"`
+	SpawnInFlight              int32        `json:"spawn_in_flight"`
+	SpawnTimeoutsTotal         int64        `json:"spawn_timeouts_total"`
+	SpawnHandshakeFailures     int64        `json:"spawn_handshake_failures_total"`
+	SpawnBindErrorsTotal       int64        `json:"spawn_bind_errors_total"`
+	StuckRespawningTotal       int64        `json:"stuck_respawning_total"`
+	AvailableQueueDroppedTotal int64        `json:"available_queue_dropped_total"`
+	ReadyWorkers               int32        `json:"ready_workers"`
+	SpawnCircuitOpen           bool         `json:"spawn_circuit_open"`
+	ConsecutiveSpawnFailures   int32        `json:"consecutive_spawn_failures"`
+	WorkersDetail              []WorkerInfo `json:"workers,omitempty"`
 }

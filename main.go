@@ -106,6 +106,12 @@ func NewServer(cfg *Config) (*Server, error) {
 		BackpressureMaxQueue:    cfg.Workers.Backpressure.MaxQueue,
 		QueueTimeoutEnabled:     cfg.Workers.QueueTimeout.Enabled,
 		QueueTimeoutMs:          cfg.Workers.QueueTimeout.TimeoutMs,
+		SpawnTimeout:            time.Duration(cfg.Workers.SpawnTimeoutSecs) * time.Second,
+		HandshakeTimeout:        time.Duration(cfg.Workers.HandshakeTimeoutSecs) * time.Second,
+		MaxParallelSpawns:       cfg.Workers.MaxParallelSpawns,
+		EnsureMinDebounce:       time.Duration(cfg.Workers.EnsureMinDebounceMs) * time.Millisecond,
+		RespawnBackoff:          time.Duration(cfg.Workers.RespawnBackoffMs) * time.Millisecond,
+		RespawnTimeout:          time.Duration(cfg.Workers.RespawnTimeoutSecs) * time.Second,
 	})
 
 	s := &Server{
@@ -424,6 +430,34 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# HELP narya_request_duration_ms_last Last request duration (ms)\n")
 	fmt.Fprintf(w, "# TYPE narya_request_duration_ms_last gauge\n")
 	fmt.Fprintf(w, "narya_request_duration_ms_last %d\n", atomic.LoadInt64(&s.metrics.LastRequestDurMs))
+
+	fmt.Fprintf(w, "# HELP narya_worker_spawn_in_flight Worker spawns in progress\n")
+	fmt.Fprintf(w, "# TYPE narya_worker_spawn_in_flight gauge\n")
+	fmt.Fprintf(w, "narya_worker_spawn_in_flight %d\n", stats.SpawnInFlight)
+
+	fmt.Fprintf(w, "# HELP narya_worker_spawn_timeouts_total Worker spawn connection timeouts\n")
+	fmt.Fprintf(w, "# TYPE narya_worker_spawn_timeouts_total counter\n")
+	fmt.Fprintf(w, "narya_worker_spawn_timeouts_total %d\n", stats.SpawnTimeoutsTotal)
+
+	fmt.Fprintf(w, "# HELP narya_worker_spawn_handshake_failures_total Worker spawn handshake failures\n")
+	fmt.Fprintf(w, "# TYPE narya_worker_spawn_handshake_failures_total counter\n")
+	fmt.Fprintf(w, "narya_worker_spawn_handshake_failures_total %d\n", stats.SpawnHandshakeFailures)
+
+	fmt.Fprintf(w, "# HELP narya_worker_spawn_bind_errors_total UDS bind errors during spawn\n")
+	fmt.Fprintf(w, "# TYPE narya_worker_spawn_bind_errors_total counter\n")
+	fmt.Fprintf(w, "narya_worker_spawn_bind_errors_total %d\n", stats.SpawnBindErrorsTotal)
+
+	fmt.Fprintf(w, "# HELP narya_worker_stuck_respawning_total Workers evicted after stuck respawning\n")
+	fmt.Fprintf(w, "# TYPE narya_worker_stuck_respawning_total counter\n")
+	fmt.Fprintf(w, "narya_worker_stuck_respawning_total %d\n", stats.StuckRespawningTotal)
+
+	fmt.Fprintf(w, "# HELP narya_workers_ready Workers idle or busy (serviceable)\n")
+	fmt.Fprintf(w, "# TYPE narya_workers_ready gauge\n")
+	fmt.Fprintf(w, "narya_workers_ready %d\n", stats.ReadyWorkers)
+
+	fmt.Fprintf(w, "# HELP narya_worker_available_queue_dropped_total Workers destroyed when available queue was saturated\n")
+	fmt.Fprintf(w, "# TYPE narya_worker_available_queue_dropped_total counter\n")
+	fmt.Fprintf(w, "narya_worker_available_queue_dropped_total %d\n", stats.AvailableQueueDroppedTotal)
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -470,12 +504,17 @@ func (s *Server) handleDebugWorkers(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(map[string]interface{}{
-		"min_workers":       stats.MinWorkers,
-		"max_workers":       stats.MaxWorkers,
-		"active_workers":    stats.ActiveWorkers,
-		"available_workers": stats.AvailableWorkers,
-		"total_requests":   stats.TotalRequests,
-		"workers":           stats.WorkersDetail,
+		"min_workers":                stats.MinWorkers,
+		"max_workers":                stats.MaxWorkers,
+		"active_workers":             stats.ActiveWorkers,
+		"dead_workers":               stats.DeadWorkers,
+		"ready_workers":              stats.ReadyWorkers,
+		"available_workers":          stats.AvailableWorkers,
+		"spawn_in_flight":            stats.SpawnInFlight,
+		"spawn_circuit_open":         stats.SpawnCircuitOpen,
+		"consecutive_spawn_failures": stats.ConsecutiveSpawnFailures,
+		"total_requests":             stats.TotalRequests,
+		"workers":                    stats.WorkersDetail,
 	})
 }
 
